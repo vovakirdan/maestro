@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local workspaces and run artifacts
+workspace/
+**/orchestrator/runs/
+**/orchestrator/setup_artifacts/
+
+# Tool caches (optional)
+.ruff_cache/
