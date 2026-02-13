@@ -37,8 +37,18 @@ def main(argv: list[str] | None = None) -> int:
 
         if args.cmd == "run":
 
-            class ProgressUI:
-                def __init__(self, *, total_steps: int) -> None:
+            class _BaseProgressUI:
+                def log_line(self, msg: str) -> None:  # pragma: no cover
+                    raise NotImplementedError
+
+                def on_event(self, wrapped: dict) -> None:  # pragma: no cover
+                    raise NotImplementedError
+
+                def finish(self) -> None:  # pragma: no cover
+                    pass
+
+            class SpinnerProgressUI(_BaseProgressUI):
+                def __init__(self, *, total_steps: int | None) -> None:
                     self._total_steps = total_steps
                     self._started = time.monotonic()
                     self._frames = ["|", "/", "-", "\\"]
@@ -115,8 +125,13 @@ def main(argv: list[str] | None = None) -> int:
                         if prefix.isdigit():
                             step_idx = str(int(prefix))
 
+                    if self._total_steps is None:
+                        step_part = f"[{step_idx}]"
+                    else:
+                        step_part = f"[{step_idx}/{self._total_steps}]"
+
                     line = (
-                        f"[{frame}] [{step_idx}/{self._total_steps}] {self._actor_id} "
+                        f"[{frame}] {step_part} {self._actor_id} "
                         f"attempt {attempt_s} | {elapsed_s:.1f}s | last={self._last_summary}"
                     )
                     pad = ""
@@ -129,8 +144,90 @@ def main(argv: list[str] | None = None) -> int:
                 def finish(self) -> None:
                     self._clear_status()
 
+            class LineProgressUI(_BaseProgressUI):
+                def __init__(self, *, total_steps: int | None) -> None:
+                    _ = total_steps
+                    self._last_summary = ""
+                    self._last_heartbeat = 0.0
+                    self._step = ""
+                    self._actor_id = ""
+                    self._attempt: int | None = None
+
+                def log_line(self, msg: str) -> None:
+                    sys.stderr.write(msg.rstrip() + "\n")
+                    sys.stderr.flush()
+
+                def _summarize(self, ev: dict) -> str | None:
+                    t = ev.get("type")
+                    if not isinstance(t, str) or not t:
+                        return None
+                    tl = t.lower()
+                    if "delta" in tl or tl in {"token"}:
+                        return None
+                    if t == "item.completed":
+                        item = ev.get("item")
+                        if isinstance(item, dict):
+                            it = item.get("type")
+                            if isinstance(it, str) and it:
+                                return f"item.completed:{it}"
+                        return "item.completed"
+                    if t == "heartbeat":
+                        idle_s = ev.get("idle_s")
+                        elapsed_s = ev.get("elapsed_s")
+                        if isinstance(idle_s, (int, float)) and isinstance(elapsed_s, (int, float)):
+                            return f"heartbeat elapsed={elapsed_s:.1f}s idle={idle_s:.1f}s"
+                        return "heartbeat"
+                    return t
+
+                def on_event(self, wrapped: dict) -> None:
+                    if wrapped.get("type") != "provider_event":
+                        return
+                    step = wrapped.get("step")
+                    actor_id = wrapped.get("actor_id")
+                    attempt = wrapped.get("attempt")
+                    if isinstance(step, str):
+                        self._step = step
+                    if isinstance(actor_id, str):
+                        self._actor_id = actor_id
+                    if isinstance(attempt, int):
+                        self._attempt = attempt
+
+                    ev = wrapped.get("event")
+                    if not isinstance(ev, dict):
+                        return
+                    summary = self._summarize(ev)
+                    if summary is None:
+                        return
+
+                    now = time.monotonic()
+                    if summary.startswith("heartbeat"):
+                        # Avoid spamming in non-interactive logs.
+                        if (now - self._last_heartbeat) < 5.0:
+                            return
+                        self._last_heartbeat = now
+
+                    if summary == self._last_summary and not summary.startswith("heartbeat"):
+                        return
+                    self._last_summary = summary
+
+                    attempt_s = str(self._attempt) if self._attempt is not None else "?"
+                    sys.stderr.write(
+                        f"progress: {self._step} {self._actor_id} attempt {attempt_s} | {summary}\n"
+                    )
+                    sys.stderr.flush()
+
             engine = OrchestratorEngine.load(workspace_dir=workspace_dir)
-            ui = ProgressUI(total_steps=len(engine.pipeline.actors))
+            total_steps: int | None
+            if engine.pipeline.orchestration is None:
+                total_steps = len(engine.pipeline.actors)
+            else:
+                total_steps = None
+
+            ui: _BaseProgressUI
+            if sys.stderr.isatty():
+                ui = SpinnerProgressUI(total_steps=total_steps)
+            else:
+                ui = LineProgressUI(total_steps=total_steps)
 
             outcome = engine.run(progress=ui.log_line, on_event=ui.on_event)
             ui.finish()

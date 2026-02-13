@@ -10,6 +10,7 @@ from typing import Any, Literal
 from src.core.types import JsonDict
 
 ProviderType = Literal["deterministic", "codex_cli"]
+PresetType = Literal["crt_v1"]
 
 
 def orchestrator_root(workspace_dir: Path) -> Path:
@@ -96,17 +97,52 @@ class ActorConfig:
 
 
 @dataclass(frozen=True)
+class OrchestrationConfig:
+    """
+    Optional run policy configuration.
+
+    If omitted, the engine runs `actors` once, sequentially, in the order listed.
+    """
+
+    preset: PresetType
+    max_returns: int = 3
+
+    def to_dict(self) -> JsonDict:
+        return {"preset": self.preset, "max_returns": self.max_returns}
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "OrchestrationConfig":
+        preset = obj.get("preset")
+        if preset == "crt":
+            preset = "crt_v1"
+        if preset not in ("crt_v1",):
+            raise ValueError(f"orchestration.preset must be 'crt_v1', got: {preset!r}")
+        max_returns_raw = obj.get("max_returns", 3)
+        try:
+            max_returns = int(max_returns_raw)
+        except Exception as e:
+            raise ValueError("orchestration.max_returns must be an int") from e
+        if max_returns < 0:
+            raise ValueError("orchestration.max_returns must be >= 0")
+        return OrchestrationConfig(preset=preset, max_returns=max_returns)
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     version: int
     provider: ProviderConfig
     actors: tuple[ActorConfig, ...]
+    orchestration: OrchestrationConfig | None = None
 
     def to_dict(self) -> JsonDict:
-        return {
+        d: JsonDict = {
             "version": self.version,
             "provider": self.provider.to_dict(),
             "actors": [a.to_dict() for a in self.actors],
         }
+        if self.orchestration is not None:
+            d["orchestration"] = self.orchestration.to_dict()
+        return d
 
     @staticmethod
     def from_dict(obj: dict[str, Any]) -> PipelineConfig:
@@ -121,7 +157,18 @@ class PipelineConfig:
         if not isinstance(actors_raw, list) or not actors_raw:
             raise ValueError("pipeline.actors must be a non-empty list")
         actors = tuple(ActorConfig.from_dict(a) for a in actors_raw)
-        return PipelineConfig(version=version, provider=provider, actors=actors)
+        orch_raw = obj.get("orchestration")
+        orchestration: OrchestrationConfig | None = None
+        if orch_raw is not None:
+            if not isinstance(orch_raw, dict):
+                raise ValueError("pipeline.orchestration must be an object")
+            orchestration = OrchestrationConfig.from_dict(orch_raw)
+        return PipelineConfig(
+            version=version,
+            provider=provider,
+            actors=actors,
+            orchestration=orchestration,
+        )
 
 
 def load_pipeline(path: Path) -> PipelineConfig:

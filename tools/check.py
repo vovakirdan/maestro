@@ -250,6 +250,50 @@ def _check_codex_jsonl_extraction(root: Path) -> list[Issue]:
     return []
 
 
+def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
+    sys.path.insert(0, str(root))
+    try:
+        from src.core.runtime import PipelineConfig
+    finally:
+        try:
+            sys.path.remove(str(root))
+        except ValueError:
+            pass
+
+    raw = {
+        "version": 1,
+        "provider": {"type": "deterministic", "timeout_s": 1.0, "idle_timeout_s": 1.0},
+        "actors": [
+            {"actor_id": "coder", "packet_dir": "coder", "include_paths_in_prompt": True},
+            {"actor_id": "reviewer", "packet_dir": "reviewer", "include_paths_in_prompt": True},
+            {"actor_id": "tester", "packet_dir": "tester", "include_paths_in_prompt": True},
+        ],
+        "orchestration": {"preset": "crt_v1", "max_returns": 3},
+    }
+    try:
+        pipeline = PipelineConfig.from_dict(raw)
+    except Exception as e:
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="PIPE001",
+                message=f"Failed to parse orchestration config: {e}",
+            )
+        ]
+    orch = pipeline.orchestration
+    if orch is None or orch.preset != "crt_v1" or orch.max_returns != 3:
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="PIPE002",
+                message=f"Unexpected orchestration parsed: {orch!r}",
+            )
+        ]
+    return []
+
+
 def _run_external_tool(
     *,
     root: Path,
@@ -311,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         all_issues.extend(_module_unused_imports(p, text))
 
     all_issues.extend(_check_codex_jsonl_extraction(root))
+    all_issues.extend(_check_pipeline_orchestration_parsing(root))
 
     if not args.no_example:
         all_issues.extend(_run_example_pipeline(root))

@@ -5,6 +5,10 @@ Commands:
     python3 main.py setup
     python3 main.py run
 
+Setup presets:
+- `crt` (coder -> reviewer -> tester): runs reviewer/tester validation and routes FAILED feedback back to coder.
+  Stops and escalates after `max_returns` returns to the coder.
+
 Workspace layout created by `setup`:
 
     <workspace>/
