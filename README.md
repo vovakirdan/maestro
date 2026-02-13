@@ -9,6 +9,16 @@ Setup presets:
 - `crt` (coder -> reviewer -> tester): runs reviewer/tester validation and routes FAILED feedback back to coder.
   Stops and escalates after `max_returns` returns to the coder.
 
+Setup also asks for a task type:
+- `feature`: prioritize backwards-compatibility and regression protection.
+- `bug`: prioritize minimal scope, repro, root cause, and regression coverage.
+- `bootstrap`: prioritize explicit scope/acceptance criteria and a runnable baseline.
+
+Before `run`, the CLI asks about planning:
+- `auto`: generate a plan via the configured provider and inject it into INPUTS.md for all steps.
+- `user`: use a user-provided plan (paste or file path).
+- `none`: run with packets only.
+
 Workspace layout created by `setup`:
 
     <workspace>/

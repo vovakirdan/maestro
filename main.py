@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from src.core.types import Status
-from src.orchestrator.engine import OrchestratorEngine
+from src.orchestrator.engine import OrchestratorEngine, PlanRequest
 from src.orchestrator.setup import run_interactive_setup
 
 
@@ -55,6 +55,7 @@ def main(argv: list[str] | None = None) -> int:
                     self._frame_i = 0
                     self._status_len = 0
                     self._last_summary = ""
+                    self._last_line_t = 0.0
                     self._step = ""
                     self._actor_id = ""
                     self._attempt: int | None = None
@@ -78,6 +79,11 @@ def main(argv: list[str] | None = None) -> int:
                     tl = t.lower()
                     if "delta" in tl or tl in {"token"}:
                         return None
+                    if t == "provider":
+                        sub = ev.get("event")
+                        if isinstance(sub, str) and sub:
+                            return f"provider:{sub}"
+                        return "provider"
                     if t == "item.completed":
                         item = ev.get("item")
                         if isinstance(item, dict):
@@ -86,7 +92,10 @@ def main(argv: list[str] | None = None) -> int:
                                 return f"item.completed:{it}"
                         return "item.completed"
                     if t == "heartbeat":
+                        elapsed_s = ev.get("elapsed_s")
                         idle_s = ev.get("idle_s")
+                        if isinstance(elapsed_s, (int, float)) and isinstance(idle_s, (int, float)):
+                            return f"heartbeat elapsed={elapsed_s:.1f}s idle={idle_s:.1f}s"
                         if isinstance(idle_s, (int, float)):
                             return f"heartbeat idle={idle_s:.1f}s"
                         return "heartbeat"
@@ -111,6 +120,17 @@ def main(argv: list[str] | None = None) -> int:
                     summary = self._summarize(ev)
                     if summary is not None:
                         self._last_summary = summary
+                        now = time.monotonic()
+                        if summary.startswith("heartbeat"):
+                            if (now - self._last_line_t) >= 5.0:
+                                self._last_line_t = now
+                                self.log_line(
+                                    f"progress: {self._step} {self._actor_id} attempt {self._attempt or '?'} | {summary}"
+                                )
+                        elif summary.startswith("item.completed") or summary.endswith("completed"):
+                            self.log_line(
+                                f"progress: {self._step} {self._actor_id} attempt {self._attempt or '?'} | {summary}"
+                            )
                     self.render()
 
                 def render(self) -> None:
@@ -164,6 +184,11 @@ def main(argv: list[str] | None = None) -> int:
                     tl = t.lower()
                     if "delta" in tl or tl in {"token"}:
                         return None
+                    if t == "provider":
+                        sub = ev.get("event")
+                        if isinstance(sub, str) and sub:
+                            return f"provider:{sub}"
+                        return "provider"
                     if t == "item.completed":
                         item = ev.get("item")
                         if isinstance(item, dict):
@@ -216,6 +241,29 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     sys.stderr.flush()
 
+            def _prompt_choice(label: str, *, choices: list[str], default: str) -> str:
+                choice_map = {c.lower(): c for c in choices}
+                while True:
+                    raw = input(f"{label} [{default}]: ").strip().lower()
+                    if not raw:
+                        return default
+                    if raw in choice_map:
+                        return choice_map[raw]
+                    print(f"Please choose one of: {', '.join(choices)}")
+
+            def _read_multiline(*, label: str) -> str:
+                print(f"{label} End input with a single '.' line:")
+                lines: list[str] = []
+                while True:
+                    try:
+                        line = input()
+                    except EOFError:
+                        break
+                    if line.strip() == ".":
+                        break
+                    lines.append(line)
+                return "\n".join(lines).strip()
+
             engine = OrchestratorEngine.load(workspace_dir=workspace_dir)
             total_steps: int | None
             if engine.pipeline.orchestration is None:
@@ -229,7 +277,29 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 ui = LineProgressUI(total_steps=total_steps)
 
-            outcome = engine.run(progress=ui.log_line, on_event=ui.on_event)
+            plan_req: PlanRequest | None = None
+            if sys.stdin.isatty():
+                allow_auto = engine.pipeline.provider.type != "deterministic"
+                plan_choices = ["none", "user"]
+                if allow_auto:
+                    plan_choices = ["auto", "user", "none"]
+                default_plan = "auto" if allow_auto else "none"
+                plan_mode = _prompt_choice(
+                    f"Plan mode ({'/'.join(plan_choices)})", choices=plan_choices, default=default_plan
+                )
+                if plan_mode == "user":
+                    plan_path = input("Plan file path (optional, press Enter to paste): ").strip()
+                    if plan_path:
+                        plan_text = Path(plan_path).expanduser().read_text(encoding="utf-8")
+                    else:
+                        plan_text = _read_multiline(label="Paste plan.")
+                    plan_req = PlanRequest(mode="user", text=plan_text)
+                elif plan_mode == "auto":
+                    plan_req = PlanRequest(mode="auto", text="")
+                else:
+                    plan_req = PlanRequest(mode="none", text="")
+
+            outcome = engine.run(progress=ui.log_line, on_event=ui.on_event, plan=plan_req)
             ui.finish()
             print("")
             print(f"Run:    {outcome.run_id}")

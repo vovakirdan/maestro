@@ -11,6 +11,7 @@ from src.core.types import JsonDict
 
 ProviderType = Literal["deterministic", "codex_cli"]
 PresetType = Literal["crt_v1"]
+TaskKind = Literal["feature", "bug", "bootstrap"]
 
 
 def orchestrator_root(workspace_dir: Path) -> Path:
@@ -128,11 +129,43 @@ class OrchestrationConfig:
 
 
 @dataclass(frozen=True)
+class TaskConfig:
+    """
+    Optional task "shape" configuration used to tailor packet templates and planning.
+
+    `details_md` is user-provided supplemental context (markdown) captured at setup time.
+    """
+
+    kind: TaskKind
+    details_md: str = ""
+
+    def to_dict(self) -> JsonDict:
+        d: JsonDict = {"kind": self.kind}
+        if self.details_md.strip():
+            d["details_md"] = self.details_md
+        return d
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "TaskConfig":
+        kind = obj.get("kind")
+        if kind not in ("feature", "bug", "bootstrap"):
+            raise ValueError(f"task.kind must be 'feature', 'bug', or 'bootstrap', got: {kind!r}")
+        details_md = obj.get("details_md", "")
+        if details_md is None:
+            details_md = ""
+        if not isinstance(details_md, str):
+            raise ValueError("task.details_md must be a string")
+        return TaskConfig(kind=kind, details_md=details_md)
+
+
+@dataclass(frozen=True)
 class PipelineConfig:
     version: int
     provider: ProviderConfig
     actors: tuple[ActorConfig, ...]
     orchestration: OrchestrationConfig | None = None
+    goal: str | None = None
+    task: TaskConfig | None = None
 
     def to_dict(self) -> JsonDict:
         d: JsonDict = {
@@ -142,6 +175,10 @@ class PipelineConfig:
         }
         if self.orchestration is not None:
             d["orchestration"] = self.orchestration.to_dict()
+        if self.goal is not None and self.goal.strip():
+            d["goal"] = self.goal
+        if self.task is not None:
+            d["task"] = self.task.to_dict()
         return d
 
     @staticmethod
@@ -163,11 +200,22 @@ class PipelineConfig:
             if not isinstance(orch_raw, dict):
                 raise ValueError("pipeline.orchestration must be an object")
             orchestration = OrchestrationConfig.from_dict(orch_raw)
+        goal = obj.get("goal")
+        if goal is not None and not isinstance(goal, str):
+            raise ValueError("pipeline.goal must be a string")
+        task_raw = obj.get("task")
+        task: TaskConfig | None = None
+        if task_raw is not None:
+            if not isinstance(task_raw, dict):
+                raise ValueError("pipeline.task must be an object")
+            task = TaskConfig.from_dict(task_raw)
         return PipelineConfig(
             version=version,
             provider=provider,
             actors=actors,
             orchestration=orchestration,
+            goal=goal,
+            task=task,
         )
 
 

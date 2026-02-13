@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from src.core.actor import Actor
 from src.core.packet import Packet
@@ -47,6 +48,15 @@ class RunOutcome:
     final_text: str
 
 
+PlanMode = Literal["none", "auto", "user"]
+
+
+@dataclass(frozen=True)
+class PlanRequest:
+    mode: PlanMode
+    text: str = ""
+
+
 @dataclass
 class OrchestratorEngine:
     orchestrator_dir: Path
@@ -73,6 +83,7 @@ class OrchestratorEngine:
         *,
         progress: Callable[[str], None] | None = None,
         on_event: Callable[[JsonDict], None] | None = None,
+        plan: PlanRequest | None = None,
     ) -> RunOutcome:
         def log(msg: str) -> None:
             if progress:
@@ -103,12 +114,135 @@ class OrchestratorEngine:
         _write_json(state_path, state)
         timeline.append({"type": "run_started", "run_id": run_id})
 
+        plan_mode: PlanMode = "none"
+        plan_text: str = ""
+        if plan is not None:
+            plan_mode = plan.mode
+            if plan_mode == "user":
+                plan_text = plan.text.strip()
+
+        def _with_plan(inputs_md: str) -> str:
+            if not plan_text.strip():
+                return inputs_md if inputs_md.endswith("\n") else (inputs_md + "\n")
+            if "## PLAN" in inputs_md.upper():
+                return inputs_md if inputs_md.endswith("\n") else (inputs_md + "\n")
+            out = inputs_md.rstrip() + "\n\n## PLAN\n\n" + plan_text.rstrip() + "\n"
+            return out if out.endswith("\n") else (out + "\n")
+
+        # Optional: generate a plan via provider before running steps.
+        if plan is not None and plan.mode == "auto":
+            if self.pipeline.provider.type == "deterministic":
+                log("WARN: plan mode 'auto' requested, but provider is deterministic; skipping plan.")
+                timeline.append(
+                    {
+                        "type": "plan_skipped",
+                        "run_id": run_id,
+                        "reason": "provider_is_deterministic",
+                    }
+                )
+            else:
+                goal = (self.pipeline.goal or "").strip()
+                task_kind = "feature"
+                task_details = ""
+                if self.pipeline.task is not None:
+                    task_kind = self.pipeline.task.kind
+                    task_details = self.pipeline.task.details_md.strip()
+                plan_prompt = "".join(
+                    [
+                        "You are producing an execution plan for a software task in a local workspace.\n\n",
+                        "Constraints:\n",
+                        "- Do not mention agents, orchestration, or pipeline order.\n",
+                        "- Keep it language-agnostic.\n",
+                        "- Be practical and actionable.\n",
+                        "- Use plain markdown (no code fences).\n\n",
+                        f"Workspace root: {self.orchestrator_dir.parent.as_posix()}\n\n",
+                        f"Task type: {task_kind}\n",
+                        "Task type notes:\n",
+                        "- feature: avoid regressions; preserve existing behavior.\n",
+                        "- bug: keep scope minimal; fix root cause; add regression coverage.\n",
+                        "- bootstrap: define scope and acceptance criteria; create a runnable baseline.\n\n",
+                        f"Goal:\n{goal or '(no goal provided)'}\n\n",
+                        (f"Task details:\n{task_details}\n\n" if task_details else ""),
+                        "Output:\n",
+                        "- A short plan with sections: Investigation, Implementation, Validation, Risks.\n",
+                        "- Keep it to a reasonable length.\n",
+                    ]
+                )
+
+                plan_dir = run_dir / "plan" / "attempt_1"
+                plan_dir.mkdir(parents=True, exist_ok=True)
+                (plan_dir / "prompt.txt").write_text(plan_prompt, encoding="utf-8")
+                timeline.append({"type": "plan_started", "run_id": run_id})
+
+                def plan_event_cb(ev: JsonDict) -> None:
+                    if on_event is None:
+                        return
+                    try:
+                        on_event(
+                            {
+                                "type": "provider_event",
+                                "run_id": run_id,
+                                "step": "00_plan",
+                                "actor_id": "plan",
+                                "attempt": 1,
+                                "event": ev,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                try:
+                    res = provider.run(
+                        plan_prompt,
+                        artifacts_dir=plan_dir,
+                        timeout_s=self.pipeline.provider.timeout_s,
+                        idle_timeout_s=self.pipeline.provider.idle_timeout_s,
+                        on_event=plan_event_cb,
+                    )
+                    plan_text = res.final_text.strip()
+                    (plan_dir / "plan.md").write_text(plan_text + "\n", encoding="utf-8")
+                    timeline.append(
+                        {
+                            "type": "plan_finished",
+                            "run_id": run_id,
+                            "ok": bool(plan_text),
+                            "provider_metadata": res.metadata,
+                        }
+                    )
+                    if not plan_text:
+                        log("WARN: auto plan generation returned empty output; continuing without plan.")
+                except Exception as e:
+                    timeline.append(
+                        {
+                            "type": "plan_failed",
+                            "run_id": run_id,
+                            "error": str(e),
+                        }
+                    )
+                    log(f"WARN: auto plan generation failed ({e}); continuing without plan.")
+                    plan_text = ""
+
+        if plan_mode != "none":
+            state["plan"] = {"mode": plan_mode, "present": bool(plan_text)}
+            _write_json(state_path, state)
+            if plan_text.strip():
+                if plan_mode == "user":
+                    pdir = run_dir / "plan"
+                    pdir.mkdir(parents=True, exist_ok=True)
+                    (pdir / "user_plan.md").write_text(plan_text.rstrip() + "\n", encoding="utf-8")
+                # Inject the plan into all run-local packet inputs once up-front.
+                for actor_cfg in self.pipeline.actors:
+                    pdir = run_packets_dir / actor_cfg.packet_dir
+                    ipath = pdir / "INPUTS.md"
+                    try:
+                        existing = ipath.read_text(encoding="utf-8")
+                    except FileNotFoundError:
+                        existing = "# INPUTS\n\n"
+                    ipath.write_text(_with_plan(existing), encoding="utf-8")
+
         def write_inputs(packet_dir: Path, content: str) -> None:
             path = packet_dir / "INPUTS.md"
-            text = content
-            if not text.endswith("\n"):
-                text += "\n"
-            path.write_text(text, encoding="utf-8")
+            path.write_text(_with_plan(content), encoding="utf-8")
 
         def run_invocation(
             invocation_i: int, actor_cfg: ActorConfig

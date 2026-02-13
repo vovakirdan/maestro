@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +14,8 @@ from src.core.runtime import (
     OrchestrationConfig,
     PipelineConfig,
     ProviderConfig,
+    TaskConfig,
+    TaskKind,
     orchestrator_root,
     save_pipeline,
 )
@@ -71,6 +76,106 @@ def _prompt_choice(label: str, *, choices: list[str], default: str) -> str:
         print(f"Please choose one of: {', '.join(choices)}")
 
 
+def _prompt_multiline_optional(label: str) -> str:
+    print(f"{label} (optional). End input with a single '.' line:")
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == ".":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+class _SetupRefineUI:
+    def __init__(self, *, label: str) -> None:
+        self._label = label
+        self._frames = ["|", "/", "-", "\\"]
+        self._frame_i = 0
+        self._status_len = 0
+        self._started = time.monotonic()
+        self._last_summary = ""
+        self._last_line = 0.0
+
+    def _clear(self) -> None:
+        if self._status_len <= 0:
+            return
+        sys.stderr.write("\r" + (" " * self._status_len) + "\r")
+        sys.stderr.flush()
+        self._status_len = 0
+
+    def log_line(self, msg: str) -> None:
+        self._clear()
+        sys.stderr.write(msg.rstrip() + "\n")
+        sys.stderr.flush()
+
+    def _summarize(self, ev: JsonDict) -> str | None:
+        t = ev.get("type")
+        if not isinstance(t, str) or not t:
+            return None
+        if t == "heartbeat":
+            elapsed_s = ev.get("elapsed_s")
+            idle_s = ev.get("idle_s")
+            if isinstance(elapsed_s, (int, float)) and isinstance(idle_s, (int, float)):
+                return f"heartbeat elapsed={elapsed_s:.1f}s idle={idle_s:.1f}s"
+            return "heartbeat"
+        if t == "provider":
+            sub = ev.get("event")
+            if isinstance(sub, str) and sub:
+                return f"provider:{sub}"
+            return "provider"
+        if t == "item.completed":
+            item = ev.get("item")
+            if isinstance(item, dict):
+                it = item.get("type")
+                if isinstance(it, str) and it:
+                    return f"item.completed:{it}"
+            return "item.completed"
+        return t
+
+    def on_event(self, ev: JsonDict) -> None:
+        try:
+            summary = self._summarize(ev)
+            if summary is None:
+                return
+            self._last_summary = summary
+            now = time.monotonic()
+            if summary.startswith("heartbeat") and (now - self._last_line) >= 5.0:
+                self._last_line = now
+                self.log_line(f"setup: {self._label} | {summary}")
+            self.render()
+        except Exception:
+            pass
+
+    def render(self) -> None:
+        elapsed = time.monotonic() - self._started
+        if sys.stderr.isatty():
+            self._frame_i = (self._frame_i + 1) % len(self._frames)
+            frame = self._frames[self._frame_i]
+            line = f"[{frame}] {self._label} | {elapsed:.1f}s | last={self._last_summary}"
+            pad = ""
+            if len(line) < self._status_len:
+                pad = " " * (self._status_len - len(line))
+            sys.stderr.write("\r" + line + pad)
+            sys.stderr.flush()
+            self._status_len = len(line)
+            return
+
+        # Non-interactive: print at most once every ~5s unless the summary changes.
+        now = time.monotonic()
+        if (now - self._last_line) < 5.0 and not self._last_summary.startswith("item.completed"):
+            return
+        self._last_line = now
+        sys.stderr.write(f"setup: {self._label} | {elapsed:.1f}s | {self._last_summary}\n")
+        sys.stderr.flush()
+
+    def finish(self) -> None:
+        self._clear()
+
+
 def _default_report_format() -> str:
     return (
         "FORMAT: ORCH_JSON_V1\n"
@@ -111,10 +216,158 @@ class AgentSpec:
     custom_role: str
 
 
+def _task_kind_title(kind: TaskKind) -> str:
+    if kind == "feature":
+        return "Feature implementation"
+    if kind == "bug":
+        return "Bug fix"
+    if kind == "bootstrap":
+        return "Bootstrap / greenfield"
+    return kind
+
+
+def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
+    if kind == "feature":
+        if template_id == "coder":
+            return (
+                "Task-specific guardrails (feature):\n"
+                "- Do not break existing functionality; treat regressions as failures.\n"
+                "- Prefer backwards-compatible changes; call out any breaking risk explicitly.\n"
+                "- Add or update validation that protects existing behavior (tests/checks).\n"
+                "- If the feature has risky rollout, propose a gradual enablement strategy.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific guardrails (feature):\n"
+                "- Look for regressions, subtle behavior changes, and backwards-compat risks.\n"
+                "- Check that validation covers both the new behavior and key existing flows.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific guardrails (feature):\n"
+                "- Include regression coverage for existing user flows near the change.\n"
+                "- Prefer a mix of automated checks and a targeted manual validation plan.\n"
+            )
+    if kind == "bug":
+        if template_id == "coder":
+            return (
+                "Task-specific guardrails (bug):\n"
+                "- Keep the fix scope minimal and focused on the root cause.\n"
+                "- Prefer to capture a repro and a regression test; avoid masking symptoms.\n"
+                "- Clearly state expected vs actual behavior and how the fix changes it.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific guardrails (bug):\n"
+                "- Verify the change addresses the root cause, not just symptoms.\n"
+                "- Watch for overly broad fixes and hidden behavior changes.\n"
+                "- Ensure there is a regression test or a clear repro/verification plan.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific guardrails (bug):\n"
+                "- Capture repro steps and verify the fix closes them.\n"
+                "- Add regression scenarios around the fix boundary.\n"
+            )
+    if kind == "bootstrap":
+        if template_id == "coder":
+            return (
+                "Task-specific guardrails (bootstrap):\n"
+                "- Define clear scope: what is in vs out.\n"
+                "- Prefer a minimal, complete, runnable baseline over lots of partial ideas.\n"
+                "- Provide run/validate instructions and explicit acceptance criteria.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific guardrails (bootstrap):\n"
+                "- Check that requirements and acceptance criteria are explicit and testable.\n"
+                "- Look for missing glue: docs, run instructions, and basic validation.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific guardrails (bootstrap):\n"
+                "- Define acceptance tests that prove the project works end-to-end.\n"
+                "- Prefer small, high-signal smoke tests over exhaustive coverage.\n"
+            )
+    return ""
+
+
+def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
+    if kind == "feature":
+        if template_id == "coder":
+            return (
+                "Task-specific deliverables (feature):\n"
+                "- Call out backwards-compat considerations and how regressions are avoided.\n"
+                "- Provide validation steps that cover both new behavior and key existing behavior.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific deliverables (feature):\n"
+                "- If changes are required, write a concise checklist in next_inputs.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific deliverables (feature):\n"
+                "- Include regression scenarios; focus on highest-risk paths.\n"
+            )
+    if kind == "bug":
+        if template_id == "coder":
+            return (
+                "Task-specific deliverables (bug):\n"
+                "- Include a root-cause summary and a minimal fix description.\n"
+                "- Include repro/verification steps and (if feasible) a regression test.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific deliverables (bug):\n"
+                "- If rejecting, include the minimal repro/verification evidence needed.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific deliverables (bug):\n"
+                "- Provide a crisp repro and a boundary-focused regression set.\n"
+            )
+    if kind == "bootstrap":
+        if template_id == "coder":
+            return (
+                "Task-specific deliverables (bootstrap):\n"
+                "- Provide a runnable baseline and clear run/validate instructions.\n"
+                "- Define explicit acceptance criteria and what is out of scope.\n"
+            )
+        if template_id == "reviewer":
+            return (
+                "Task-specific deliverables (bootstrap):\n"
+                "- Call out missing requirements, unclear acceptance criteria, or unsafe defaults.\n"
+            )
+        if template_id == "tester":
+            return (
+                "Task-specific deliverables (bootstrap):\n"
+                "- Provide smoke tests / acceptance tests for the baseline.\n"
+            )
+    return ""
+
+
+def _task_context_appendix(task: TaskConfig | None) -> str:
+    if task is None:
+        return ""
+    parts: list[str] = []
+    parts.append("## Task type")
+    parts.append("")
+    parts.append(_task_kind_title(task.kind))
+    if task.details_md.strip():
+        parts.append("")
+        parts.append("## Task details")
+        parts.append("")
+        parts.append(task.details_md.strip())
+    parts.append("")
+    return "\n".join(parts)
+
+
 def _base_packet_docs(
     *,
     workspace_dir: Path,
     goal: str,
+    task: TaskConfig | None,
     agent: AgentSpec,
     is_first: bool,
 ) -> dict[str, str]:
@@ -134,6 +387,15 @@ def _base_packet_docs(
         context_md = tmpl.base_context_md
         target_md = tmpl.build_target_md(goal, agent.actor_id, None)
 
+    task_kind = task.kind if task is not None else "feature"
+    task_target_extra = _task_target_appendix(task_kind, template_id=agent.template_id)
+    if task_target_extra.strip():
+        target_md = target_md.rstrip() + "\n\n" + task_target_extra.rstrip() + "\n"
+
+    task_rules_extra = _task_rules_appendix(task_kind, template_id=agent.template_id)
+    if task_rules_extra.strip():
+        rules_md = rules_md.rstrip() + "\n\n" + task_rules_extra.rstrip() + "\n"
+
     context_md = (
         context_md.rstrip()
         + "\n\n"
@@ -141,16 +403,28 @@ def _base_packet_docs(
         + f"Workspace root: {workspace_dir.as_posix()}\n"
         + "\n"
     )
+    task_ctx = _task_context_appendix(task)
+    if task_ctx.strip():
+        context_md = context_md.rstrip() + "\n\n" + task_ctx.rstrip() + "\n"
 
     if is_first:
         inputs_md = (
             "# INPUTS\n\n"
             f"Initial request:\n{goal}\n\n"
+            f"Task type: {_task_kind_title(task_kind)}\n\n"
             "Additional constraints:\n"
             "- (none provided)\n\n"
             "Notes:\n"
             "- Use this file for any extra requirements or clarifications.\n"
         )
+        if task is not None and task.details_md.strip():
+            inputs_md = (
+                inputs_md.rstrip()
+                + "\n\n"
+                + "Task details:\n\n"
+                + task.details_md.strip()
+                + "\n"
+            )
     else:
         inputs_md = (
             "# INPUTS\n\n"
@@ -174,6 +448,7 @@ def _refine_packet_docs_via_provider(
     *,
     artifacts_dir: Path,
     goal: str,
+    task: TaskConfig | None,
     agent: AgentSpec,
     base_role_md: str,
     base_target_md: str,
@@ -181,44 +456,55 @@ def _refine_packet_docs_via_provider(
     base_context_md: str,
     timeout_s: float,
     idle_timeout_s: float,
+    on_event: Callable[[JsonDict], None] | None = None,
 ) -> tuple[dict[str, str] | None, JsonDict]:
     specialization = agent.specialization.strip() or "(none)"
-    prompt = (
-        "You are refining packet documents (ROLE/TARGET/RULES/CONTEXT) for an isolated agent.\n\n"
-        "Goal: produce high-quality instructions with a strong quality bar.\n"
-        "The documents should be practical, specific, and deterministic.\n\n"
-        "Hard constraints:\n"
-        "- Keep the top-level headings exactly: # ROLE, # TARGET, # RULES, # CONTEXT.\n"
-        "- Do not mention other agents, pipeline order, or orchestration.\n"
-        "- Keep rules language-agnostic (no language/framework-specific advice).\n"
-        "- Do not output markdown fences.\n"
-        "- Do not change the output protocol: the agent must follow REPORT_FORMAT.md.\n\n"
-        "Content guidelines (make this substantially more detailed than the base docs):\n"
-        "- ROLE: responsibilities, non-goals, decision making, definition of done.\n"
-        "- TARGET: explicit deliverables and success criteria for this step.\n"
-        "- RULES: correctness, minimal change, avoiding hallucinations, validation expectations.\n"
-        "- CONTEXT: how to use INPUTS.md, how to handle ambiguity, where to look in workspace.\n\n"
-        "Return exactly one JSON object with keys:\n"
-        "- role_md\n"
-        "- target_md\n"
-        "- rules_md\n"
-        "- context_md\n"
-        "No extra keys. Values must be non-empty strings.\n\n"
-        f"Goal:\n{goal}\n\n"
-        f"Agent id: {agent.actor_id}\n"
-        f"Template: {agent.template_id}\n"
-        f"Specialization: {specialization}\n\n"
-        "REPORT_FORMAT.md (do not edit, but your docs must be consistent with it):\n"
-        f"{_default_report_format()}\n"
-        "\n"
-        "Current ROLE.md:\n"
-        f"{base_role_md}\n\n"
-        "Current TARGET.md:\n"
-        f"{base_target_md}\n\n"
-        "Current RULES.md:\n"
-        f"{base_rules_md}\n\n"
-        "Current CONTEXT.md:\n"
-        f"{base_context_md}\n"
+    task_kind = task.kind if task is not None else "feature"
+    task_details = task.details_md.strip() if task is not None else ""
+    task_details_block = ""
+    if task_details:
+        task_details_block = f"Task details:\n{task_details}\n\n"
+
+    prompt = "".join(
+        [
+            "You are refining packet documents (ROLE/TARGET/RULES/CONTEXT) for an isolated agent.\n\n",
+            "Goal: produce high-quality instructions with a strong quality bar.\n",
+            "The documents should be practical, specific, and deterministic.\n\n",
+            "Hard constraints:\n",
+            "- Keep the top-level headings exactly: # ROLE, # TARGET, # RULES, # CONTEXT.\n",
+            "- Do not mention other agents, pipeline order, or orchestration.\n",
+            "- Keep rules language-agnostic (no language/framework-specific advice).\n",
+            "- Do not output markdown fences.\n",
+            "- Do not change the output protocol: the agent must follow REPORT_FORMAT.md.\n\n",
+            "Content guidelines (make this substantially more detailed than the base docs):\n",
+            "- ROLE: responsibilities, non-goals, decision making, definition of done.\n",
+            "- TARGET: explicit deliverables and success criteria for this step.\n",
+            "- RULES: correctness, minimal change, avoiding hallucinations, validation expectations.\n",
+            "- CONTEXT: how to use INPUTS.md, how to handle ambiguity, where to look in workspace.\n\n",
+            "Return exactly one JSON object with keys:\n",
+            "- role_md\n",
+            "- target_md\n",
+            "- rules_md\n",
+            "- context_md\n",
+            "No extra keys. Values must be non-empty strings.\n\n",
+            f"Goal:\n{goal}\n\n",
+            f"Task type: {_task_kind_title(task_kind)}\n\n",
+            task_details_block,
+            f"Agent id: {agent.actor_id}\n",
+            f"Template: {agent.template_id}\n",
+            f"Specialization: {specialization}\n\n",
+            "REPORT_FORMAT.md (do not edit, but your docs must be consistent with it):\n",
+            f"{_default_report_format()}\n",
+            "\n",
+            "Current ROLE.md:\n",
+            f"{base_role_md}\n\n",
+            "Current TARGET.md:\n",
+            f"{base_target_md}\n\n",
+            "Current RULES.md:\n",
+            f"{base_rules_md}\n\n",
+            "Current CONTEXT.md:\n",
+            f"{base_context_md}\n",
+        ]
     )
 
     res = provider.run(
@@ -226,6 +512,7 @@ def _refine_packet_docs_via_provider(
         artifacts_dir=artifacts_dir,
         timeout_s=timeout_s,
         idle_timeout_s=idle_timeout_s,
+        on_event=on_event,
     )
 
     obj = _extract_first_json_object(res.final_text)
@@ -281,7 +568,31 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     print(f"- {runs_dir}")
     print("")
 
-    goal = _prompt_line("What is the goal of orchestration?")
+    task_kind = _prompt_choice(
+        "Task type (feature/bug/bootstrap)",
+        choices=["feature", "bug", "bootstrap"],
+        default="feature",
+    )
+    goal_label = "What is the goal of orchestration?"
+    if task_kind == "feature":
+        goal_label = "What feature do you want to implement?"
+    elif task_kind == "bug":
+        goal_label = "What bug do you want to fix?"
+    elif task_kind == "bootstrap":
+        goal_label = "What do you want to build from scratch?"
+    goal = _prompt_line(goal_label)
+
+    print("")
+    if task_kind == "feature":
+        print("Task details hint (optional): acceptance criteria, constraints, rollout/compat notes.")
+    elif task_kind == "bug":
+        print("Task details hint (optional): repro steps, expected vs actual, scope constraints.")
+    else:
+        print("Task details hint (optional): requirements, non-goals, constraints, acceptance criteria.")
+    details = _prompt_multiline_optional("Task details")
+    task = TaskConfig(kind=task_kind, details_md=details)
+    print("")
+
     preset = _prompt_choice(
         "Orchestration preset (crt/custom)",
         choices=["crt", "custom"],
@@ -413,6 +724,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         docs = _base_packet_docs(
             workspace_dir=workspace_dir,
             goal=goal,
+            task=task,
             agent=agent,
             is_first=i == 1,
         )
@@ -420,10 +732,12 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         if refine_now and provider_cfg.type == "codex_cli":
             gen_dir = orch_dir / "setup_artifacts" / agent.actor_id
             gen_dir.mkdir(parents=True, exist_ok=True)
+            ui = _SetupRefineUI(label=f"refine:{agent.actor_id}")
             refined, meta = _refine_packet_docs_via_provider(
                 provider,
                 artifacts_dir=gen_dir,
                 goal=goal,
+                task=task,
                 agent=agent,
                 base_role_md=docs["ROLE"],
                 base_target_md=docs["TARGET"],
@@ -431,7 +745,9 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                 base_context_md=docs["CONTEXT"],
                 timeout_s=provider_cfg.timeout_s,
                 idle_timeout_s=provider_cfg.idle_timeout_s,
+                on_event=ui.on_event,
             )
+            ui.finish()
             if refined is not None:
                 docs.update(refined)
             else:
@@ -457,6 +773,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         provider=provider_cfg,
         actors=tuple(actor_cfgs),
         orchestration=orchestration,
+        goal=goal,
+        task=task,
     )
     save_pipeline(pipeline_path, pipeline)
 
