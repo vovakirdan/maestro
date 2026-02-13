@@ -213,6 +213,43 @@ def _run_example_pipeline(root: Path) -> list[Issue]:
     return issues
 
 
+def _check_codex_jsonl_extraction(root: Path) -> list[Issue]:
+    """
+    Unit-style check: Codex JSONL often emits the final assistant content as:
+        {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    Ensure we extract that correctly.
+    """
+    sys.path.insert(0, str(root))
+    try:
+        from src.providers.codex_cli import _extract_final_agent_message
+    finally:
+        try:
+            sys.path.remove(str(root))
+        except ValueError:
+            pass
+
+    events = [
+        {"type": "thread.started", "thread_id": "t"},
+        {"type": "turn.started"},
+        {
+            "type": "item.completed",
+            "item": {"id": "item_0", "type": "agent_message", "text": "HELLO"},
+        },
+        {"type": "turn.completed"},
+    ]
+    final_text, _source = _extract_final_agent_message(events, raw_stdout="")
+    if final_text != "HELLO":
+        return [
+            Issue(
+                path=root / "src" / "providers" / "codex_cli.py",
+                line=None,
+                code="CODEX001",
+                message=f"Expected 'HELLO' from item.completed extraction, got: {final_text!r}",
+            )
+        ]
+    return []
+
+
 def _run_external_tool(
     *,
     root: Path,
@@ -272,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
         all_issues.extend(_check_text_conventions(p, text))
         all_issues.extend(_compile_check(p))
         all_issues.extend(_module_unused_imports(p, text))
+
+    all_issues.extend(_check_codex_jsonl_extraction(root))
 
     if not args.no_example:
         all_issues.extend(_run_example_pipeline(root))

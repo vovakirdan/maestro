@@ -5,7 +5,7 @@ import os
 import selectors
 import subprocess
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +34,17 @@ def _extract_final_agent_message(events: Sequence[JsonDict], raw_stdout: str) ->
         if not isinstance(obj, dict):
             return None
 
+        # Prefer Codex JSONL events that contain the final agent message.
+        if obj.get("type") == "item.completed":
+            item = obj.get("item")
+            if isinstance(item, dict) and item.get("type") in {
+                "agent_message",
+                "assistant_message",
+            }:
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    return text
+
         # Ignore likely token-delta events.
         t = obj.get("type")
         if isinstance(t, str) and t.lower() in {"token", "delta"}:
@@ -46,13 +57,17 @@ def _extract_final_agent_message(events: Sequence[JsonDict], raw_stdout: str) ->
             if isinstance(v, str) and v.strip():
                 return v
 
-        data = obj.get("data")
-        if isinstance(data, dict):
-            return candidate_from_obj(data)
+        for nested_key in ("item", "data"):
+            nested = obj.get(nested_key)
+            if isinstance(nested, dict):
+                cand = candidate_from_obj(nested)
+                if cand:
+                    return cand
         return None
 
     final_preferred: str | None = None
     last_any: str | None = None
+    last_item_completed_message: tuple[str, str] | None = None
 
     for ev in events:
         if not isinstance(ev, dict):
@@ -61,9 +76,24 @@ def _extract_final_agent_message(events: Sequence[JsonDict], raw_stdout: str) ->
         if cand:
             last_any = cand
             t = ev.get("type")
+            if isinstance(t, str) and t == "item.completed":
+                item = ev.get("item")
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") in {"agent_message", "assistant_message"}
+                    and isinstance(item.get("text"), str)
+                    and item.get("text", "").strip()
+                ):
+                    last_item_completed_message = (item["text"], item["type"])
             if isinstance(t, str) and t.lower() in {"final", "agent_message", "assistant_message"}:
                 final_preferred = cand
 
+    if last_item_completed_message is not None:
+        text, item_type = last_item_completed_message
+        return (
+            text,
+            f"events:item.completed:item.type={item_type}",
+        )
     if final_preferred is not None:
         return final_preferred, "events:type=final-like"
     if last_any is not None:
@@ -79,7 +109,8 @@ class CodexCLIProvider:
     Provider that shells out to a local Codex CLI and parses JSONL events from stdout.
 
     The exact CLI flags are intentionally configurable via `command`.
-    This provider assumes stdout is JSONL (one JSON object per line).
+    This provider assumes stdout is JSONL (one JSON object per line), e.g. `codex exec --json`.
+    The prompt is written to stdin.
     """
 
     command: tuple[str, ...]
@@ -94,6 +125,7 @@ class CodexCLIProvider:
         artifacts_dir: Path,
         timeout_s: float,
         idle_timeout_s: float,
+        on_event: Callable[[JsonDict], None] | None = None,
     ) -> ProviderResult:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -110,6 +142,7 @@ class CodexCLIProvider:
 
         started = time.monotonic()
         last_output = started
+        last_heartbeat = started
         timed_out = False
         idle_timed_out = False
         kill_sent = False
@@ -151,6 +184,15 @@ class CodexCLIProvider:
         sel = selectors.DefaultSelector()
         sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
         sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+        def deliver(ev: JsonDict) -> None:
+            if on_event is None:
+                return
+            try:
+                on_event(ev)
+            except Exception:
+                # Never fail a run due to UI/event-consumer issues.
+                pass
 
         while True:
             now = time.monotonic()
@@ -204,15 +246,33 @@ class CodexCLIProvider:
                             obj = json.loads(stripped)
                             if isinstance(obj, dict):
                                 parsed_events.append(obj)
+                                deliver(obj)
                             else:
-                                parsed_events.append({"type": "non_dict_event", "value": obj})
+                                ev = {"type": "non_dict_event", "value": obj}
+                                parsed_events.append(ev)
+                                deliver(ev)
                         except json.JSONDecodeError:
-                            parsed_events.append({"type": "non_json_stdout", "text": stripped})
+                            ev = {"type": "non_json_stdout", "text": stripped}
+                            parsed_events.append(ev)
+                            deliver(ev)
                 else:
                     stderr_lines.append(line)
 
             if proc.poll() is not None and not sel.get_map():
                 break
+
+            # Provider-generated heartbeat: allows UI to show progress even if Codex is silent.
+            now = time.monotonic()
+            if on_event is not None and proc.poll() is None:
+                if (now - last_output) >= 1.0 and (now - last_heartbeat) >= 1.0:
+                    deliver(
+                        {
+                            "type": "heartbeat",
+                            "elapsed_s": round(now - started, 1),
+                            "idle_s": round(now - last_output, 1),
+                        }
+                    )
+                    last_heartbeat = now
 
         try:
             sel.close()

@@ -65,10 +65,15 @@ class OrchestratorEngine:
             return DeterministicProvider()
         if cfg.type == "codex_cli":
             assert cfg.command is not None
-            return CodexCLIProvider(command=cfg.command)
+            return CodexCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
         raise ValueError(f"Unsupported provider type: {cfg.type!r}")
 
-    def run(self, *, progress: Callable[[str], None] | None = None) -> RunOutcome:
+    def run(
+        self,
+        *,
+        progress: Callable[[str], None] | None = None,
+        on_event: Callable[[JsonDict], None] | None = None,
+    ) -> RunOutcome:
         def log(msg: str) -> None:
             if progress:
                 progress(msg)
@@ -108,7 +113,7 @@ class OrchestratorEngine:
             step_dir = steps_dir / step_name
             step_dir.mkdir(parents=True, exist_ok=False)
 
-            log(f"[{idx}/{len(self.pipeline.actors)}] Running {actor_id} ...")
+            log(f"[{idx}/{len(self.pipeline.actors)}] {actor_id}: step started")
             timeline.append(
                 {"type": "step_started", "run_id": run_id, "step": step_name, "actor_id": actor_id}
             )
@@ -130,14 +135,40 @@ class OrchestratorEngine:
 
             for attempt in (1, 2):
                 attempt_dir = step_dir / f"attempt_{attempt}"
+                log(f"  {actor_id}: attempt {attempt}/2")
                 extra = None
                 if attempt == 2:
                     extra = retry_instructions(attempt_errors)
+
+                def provider_event_cb(
+                    ev: JsonDict,
+                    *,
+                    _attempt: int = attempt,
+                    _step: str = step_name,
+                    _actor: str = actor_id,
+                ) -> None:
+                    if on_event is None:
+                        return
+                    try:
+                        on_event(
+                            {
+                                "type": "provider_event",
+                                "run_id": run_id,
+                                "step": _step,
+                                "actor_id": _actor,
+                                "attempt": _attempt,
+                                "event": ev,
+                            }
+                        )
+                    except Exception:
+                        pass
+
                 res = actor.run(
                     artifacts_dir=attempt_dir,
                     timeout_s=self.pipeline.provider.timeout_s,
                     idle_timeout_s=self.pipeline.provider.idle_timeout_s,
                     extra_instructions=extra,
+                    on_event=provider_event_cb,
                 )
 
                 validated_text = res.final_text
@@ -165,8 +196,10 @@ class OrchestratorEngine:
                 )
 
                 if v.ok and v.report is not None:
+                    log(f"  {actor_id}: attempt {attempt}/2 validation OK")
                     validated_report = v.report
                     break
+                log(f"  {actor_id}: attempt {attempt}/2 validation FAILED")
                 attempt_errors = v.errors
 
             # Canonical step outputs.

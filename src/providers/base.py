@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -26,4 +27,5 @@ class Provider(Protocol):
         artifacts_dir: Path,
         timeout_s: float,
         idle_timeout_s: float,
+        on_event: Callable[[JsonDict], None] | None = None,
     ) -> ProviderResult: ...

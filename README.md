@@ -30,7 +30,7 @@ Workspace layout created by `setup`:
 
 Providers:
 - `deterministic`: offline provider for predictable runs.
-- `codex_cli`: shells out to a configurable Codex CLI command and parses JSONL from stdout.
+- `codex_cli`: shells out to a configurable Codex CLI command and parses JSONL from stdout (recommended: `codex exec --json --full-auto`).
 
 Example (offline):
 

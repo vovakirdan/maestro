@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,6 +47,7 @@ class Actor:
         timeout_s: float,
         idle_timeout_s: float,
         extra_instructions: str | None = None,
+        on_event: Callable[[JsonDict], None] | None = None,
     ) -> ActorResult:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -58,6 +60,7 @@ class Actor:
             artifacts_dir=artifacts_dir,
             timeout_s=timeout_s,
             idle_timeout_s=idle_timeout_s,
+            on_event=on_event,
         )
 
         final_text = provider_result.final_text

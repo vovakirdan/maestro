@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,14 +54,38 @@ class DeterministicProvider:
         artifacts_dir: Path,
         timeout_s: float,
         idle_timeout_s: float,
+        on_event: Callable[[JsonDict], None] | None = None,
     ) -> ProviderResult:
         started_monotonic = time.monotonic()
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+        events: list[JsonDict] = []
+
+        def emit(ev: JsonDict) -> None:
+            events.append(ev)
+            if on_event is None:
+                return
+            try:
+                on_event(ev)
+            except Exception:
+                # Never fail a run due to UI/event-consumer issues.
+                pass
+
+        emit({"type": "provider", "provider": self.provider_name, "event": "start"})
 
         prompt_bytes = prompt.encode("utf-8", errors="strict")
         prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
         inputs_text = _extract_section(prompt, section="INPUTS")
         inputs_sha256 = hashlib.sha256(inputs_text.encode("utf-8", errors="strict")).hexdigest()
+
+        emit(
+            {
+                "type": "provider",
+                "provider": self.provider_name,
+                "event": "prompt_digest",
+                "sha256": prompt_sha256,
+            }
+        )
 
         final_obj: JsonDict = {
             "status": "OK",
@@ -73,16 +98,7 @@ class DeterministicProvider:
         }
         final_text = json.dumps(final_obj, indent=2, sort_keys=True) + "\n"
 
-        events: list[JsonDict] = [
-            {"type": "provider", "provider": self.provider_name, "event": "start"},
-            {
-                "type": "provider",
-                "provider": self.provider_name,
-                "event": "prompt_digest",
-                "sha256": prompt_sha256,
-            },
-            {"type": "provider", "provider": self.provider_name, "event": "finish"},
-        ]
+        emit({"type": "provider", "provider": self.provider_name, "event": "finish"})
         metadata: JsonDict = {
             "provider": self.provider_name,
             "duration_s": round(time.monotonic() - started_monotonic, 6),
