@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -57,6 +58,15 @@ class PlanRequest:
     text: str = ""
 
 
+GitMode = Literal["off", "check", "branch"]
+
+
+@dataclass(frozen=True)
+class GitPolicy:
+    mode: GitMode = "off"
+    branch_prefix: str = "orch/"
+
+
 @dataclass
 class OrchestratorEngine:
     orchestrator_dir: Path
@@ -84,6 +94,7 @@ class OrchestratorEngine:
         progress: Callable[[str], None] | None = None,
         on_event: Callable[[JsonDict], None] | None = None,
         plan: PlanRequest | None = None,
+        git: GitPolicy | None = None,
     ) -> RunOutcome:
         def log(msg: str) -> None:
             if progress:
@@ -113,6 +124,105 @@ class OrchestratorEngine:
         }
         _write_json(state_path, state)
         timeline.append({"type": "run_started", "run_id": run_id})
+
+        workspace_root = self.orchestrator_dir.parent
+
+        def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", *args],
+                cwd=str(workspace_root),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+        def _git_repo_root() -> Path | None:
+            p = _run_git(["rev-parse", "--show-toplevel"])
+            if p.returncode != 0:
+                return None
+            raw = (p.stdout or "").strip()
+            if not raw:
+                return None
+            try:
+                return Path(raw).resolve()
+            except Exception:
+                return None
+
+        def _git_current_branch() -> str | None:
+            p = _run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+            if p.returncode != 0:
+                return None
+            b = (p.stdout or "").strip()
+            return b or None
+
+        def _git_is_clean() -> tuple[bool, str]:
+            p = _run_git(["status", "--porcelain"])
+            if p.returncode != 0:
+                return False, (p.stderr or "").strip()
+            out = (p.stdout or "").strip()
+            return (out == ""), out
+
+        # Optional git safety policy (check cleanliness / create a dedicated branch for the run).
+        if git is not None and git.mode != "off":
+            repo_root = _git_repo_root()
+            if repo_root is None:
+                raise ValueError("Git policy requested, but workspace is not a git repository")
+            if repo_root != workspace_root.resolve():
+                raise ValueError(
+                    "Git policy requested, but workspace is not the git repo root "
+                    f"(repo_root={repo_root}, workspace={workspace_root.resolve()})"
+                )
+
+            clean, details = _git_is_clean()
+            if not clean:
+                raise ValueError(
+                    "Workspace has uncommitted changes; commit/stash first or disable git policy. "
+                    f"status_porcelain:\n{details}"
+                )
+
+            original_branch = _git_current_branch() or "unknown"
+            state["git"] = {
+                "mode": git.mode,
+                "repo_root": repo_root.as_posix(),
+                "original_branch": original_branch,
+                "clean": True,
+            }
+            _write_json(state_path, state)
+            timeline.append(
+                {
+                    "type": "git_checked",
+                    "run_id": run_id,
+                    "mode": git.mode,
+                    "repo_root": repo_root.as_posix(),
+                    "original_branch": original_branch,
+                }
+            )
+
+            if git.mode == "branch":
+                prefix = (git.branch_prefix or "orch/").strip()
+                if not prefix:
+                    prefix = "orch/"
+                if " " in prefix or "\t" in prefix or "\n" in prefix:
+                    raise ValueError(f"Invalid git.branch_prefix (contains whitespace): {prefix!r}")
+                branch_name = prefix + run_id
+                p = _run_git(["checkout", "-b", branch_name])
+                if p.returncode != 0:
+                    raise ValueError(
+                        "Failed to create git branch for run: "
+                        f"{branch_name!r} stderr={(p.stderr or '').strip()!r}"
+                    )
+                active_branch = _git_current_branch() or branch_name
+                state["git"]["run_branch"] = active_branch
+                _write_json(state_path, state)
+                timeline.append(
+                    {
+                        "type": "git_branch_created",
+                        "run_id": run_id,
+                        "branch": active_branch,
+                        "original_branch": original_branch,
+                    }
+                )
+                log(f"git: checked out {active_branch} (original={original_branch})")
 
         plan_mode: PlanMode = "none"
         plan_text: str = ""

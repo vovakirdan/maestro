@@ -294,6 +294,59 @@ def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
     return []
 
 
+def _check_pipeline_task_parsing(root: Path) -> list[Issue]:
+    sys.path.insert(0, str(root))
+    try:
+        from src.core.runtime import PipelineConfig
+    finally:
+        try:
+            sys.path.remove(str(root))
+        except ValueError:
+            pass
+
+    raw = {
+        "version": 1,
+        "goal": "G",
+        "task": {"kind": "bug", "details_md": "repro"},
+        "provider": {"type": "deterministic", "timeout_s": 1.0, "idle_timeout_s": 1.0},
+        "actors": [
+            {"actor_id": "coder", "packet_dir": "coder", "include_paths_in_prompt": True},
+            {"actor_id": "reviewer", "packet_dir": "reviewer", "include_paths_in_prompt": True},
+            {"actor_id": "tester", "packet_dir": "tester", "include_paths_in_prompt": True},
+        ],
+    }
+    try:
+        pipeline = PipelineConfig.from_dict(raw)
+    except Exception as e:
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="TASK001",
+                message=f"Failed to parse task config: {e}",
+            )
+        ]
+    if pipeline.goal != "G":
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="TASK002",
+                message=f"Unexpected goal parsed: {pipeline.goal!r}",
+            )
+        ]
+    if pipeline.task is None or pipeline.task.kind != "bug" or pipeline.task.details_md != "repro":
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="TASK003",
+                message=f"Unexpected task parsed: {pipeline.task!r}",
+            )
+        ]
+    return []
+
+
 def _run_external_tool(
     *,
     root: Path,
@@ -356,6 +409,7 @@ def main(argv: list[str] | None = None) -> int:
 
     all_issues.extend(_check_codex_jsonl_extraction(root))
     all_issues.extend(_check_pipeline_orchestration_parsing(root))
+    all_issues.extend(_check_pipeline_task_parsing(root))
 
     if not args.no_example:
         all_issues.extend(_run_example_pipeline(root))

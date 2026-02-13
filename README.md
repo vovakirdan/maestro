@@ -19,6 +19,11 @@ Before `run`, the CLI asks about planning:
 - `user`: use a user-provided plan (paste or file path).
 - `none`: run with packets only.
 
+Before `run`, the CLI can also apply a git safety policy (if the workspace is a git repo root):
+- `branch`: require a clean working tree and checkout a new branch `orch/<run_id>` (configurable prefix).
+- `check`: require a clean working tree but do not switch branches.
+- `off`: no git checks.
+
 Workspace layout created by `setup`:
 
     <workspace>/

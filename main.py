@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from src.core.types import Status
-from src.orchestrator.engine import OrchestratorEngine, PlanRequest
+from src.orchestrator.engine import GitPolicy, OrchestratorEngine, PlanRequest
 from src.orchestrator.setup import run_interactive_setup
 
 
@@ -299,7 +299,28 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     plan_req = PlanRequest(mode="none", text="")
 
-            outcome = engine.run(progress=ui.log_line, on_event=ui.on_event, plan=plan_req)
+            git_policy: GitPolicy | None = None
+            if sys.stdin.isatty():
+                ws = workspace_dir.resolve()
+                is_git_root = (ws / ".git").exists()
+                if is_git_root:
+                    git_mode = _prompt_choice(
+                        "Git safety (branch/check/off)",
+                        choices=["branch", "check", "off"],
+                        default="branch",
+                    )
+                    if git_mode != "off":
+                        prefix = ""
+                        if git_mode == "branch":
+                            prefix = input("Git branch prefix [orch/]: ").strip() or "orch/"
+                        git_policy = GitPolicy(mode=git_mode, branch_prefix=prefix or "orch/")
+
+            outcome = engine.run(
+                progress=ui.log_line,
+                on_event=ui.on_event,
+                plan=plan_req,
+                git=git_policy,
+            )
             ui.finish()
             print("")
             print(f"Run:    {outcome.run_id}")
