@@ -1,65 +1,109 @@
 Minimal multi-agent orchestration system (Python standard library only).
 
+This repo provides:
+- Packet-based, provider-agnostic actors (ROLE/TARGET/RULES/CONTEXT/REPORT_FORMAT/INPUTS/NOTES).
+- Pluggable providers: `deterministic` (offline) and `codex_cli` (Codex CLI JSONL).
+- A sequential orchestrator with an optional linear "return-on-failure" loop.
+- An interactive `setup` wizard (human prompts) plus an optional AI setup-wizard stage (Codex only).
+- Optional plan injection, git safety, auto-commit, and merge request instructions.
+
 Commands:
 
-    python3 main.py setup
-    python3 main.py run
-
-Timeouts:
-- The provider has two timeouts: `timeout_s` (hard wall-clock) and `idle_timeout_s` (no stdout/stderr).
-- Set either to `0` to disable it.
-- For long-running Codex runs, prefer `timeout_s=0` (no hard limit) and keep a reasonable `idle_timeout_s`.
-
-Setup presets:
-- `crt` (coder -> reviewer -> tester): runs reviewer/tester validation and routes FAILED feedback back to coder.
-  Stops and escalates after `max_returns` returns to the coder.
-- `cr` (coder -> reviewer): runs reviewer validation and routes FAILED feedback back to coder.
-  Stops and escalates after `max_returns` returns to the coder.
-
-Setup also asks for a task type:
-- `feature`: prioritize backwards-compatibility and regression protection.
-- `bug`: prioritize minimal scope, repro, root cause, and regression coverage.
-- `bootstrap`: prioritize explicit scope/acceptance criteria and a runnable baseline.
-
-Before `run`, the CLI asks about planning:
-- `auto`: generate a plan via the configured provider and inject it into INPUTS.md for all steps.
-- `user`: use a user-provided plan (paste or file path).
-- `none`: run with packets only.
-
-Before `run`, the CLI can also apply a git safety policy (if the workspace is a git repo root):
-- `branch`: require a clean working tree and checkout a new branch `orch/<run_id>` (configurable prefix).
-- `check`: require a clean working tree but do not switch branches.
-- `off`: no git checks.
-
-When `Git safety=branch`, the CLI can also auto-commit after coder steps (optional). This makes review loops
-more pragmatic by turning each coder output into a concrete commit for the reviewer to inspect.
+    python3 main.py setup --workspace /path/to/workspace
+    python3 main.py run --workspace /path/to/workspace
 
 Workspace layout created by `setup`:
 
     <workspace>/
       orchestrator/
         pipeline.json
+        BRIEF.md                 # only when AI setup wizard runs
+        setup_artifacts/         # provider artifacts from setup wizard runs
         packets/
-          agent_1/
+          <actor_id>/
             ROLE.md
             TARGET.md
             RULES.md
             CONTEXT.md
             REPORT_FORMAT.md
             INPUTS.md
-            NOTES.md
-          agent_2/
-          ...
+            NOTES.md             # append-only; managed by orchestrator during runs
         runs/
           <run_id>/
             state.json
             timeline.jsonl
-            packets/        # run-local packet copies
-            steps/          # per-step artifacts
+            final.txt
+            final_report.json
+            plan/                # auto/user plan artifacts (if enabled)
+            packets/             # run-local packet copies (inputs are modified here)
+            steps/               # per-step artifacts (attempts, validation, commits)
+              <nn_actor_id>/
+                final.txt
+                report.json
+                commit.json      # only if auto-commit created a commit
+                attempt_1/
+                attempt_2/
+            delivery/            # MR instructions (if enabled)
+
+Setup flow:
+- Task type (feature/bug/bootstrap/other).
+- Workflow preset (crt/cr/c/r/t/d/custom).
+- Provider selection:
+  - `deterministic`: offline, no AI generation.
+  - `codex_cli`: requires a local Codex CLI command that emits JSONL on stdout (use `--json`).
+- Optional: "setup wizard (AI)" (Codex only):
+  - `wizard:analyze` writes `orchestrator/BRIEF.md` (high-signal decomposition).
+  - `wizard:packet:<actor_id>` rewrites packet docs to be detailed and executable.
+  - Packet docs are written for isolated agents (no orchestration/other-agent mentions).
+  - Setup artifacts are saved under `orchestrator/setup_artifacts/` for debugging.
+- If task type is `bootstrap` and the workspace is not a git repo, setup can optionally run `git init`.
+
+Workflow presets:
+- `crt`: coder -> reviewer -> tester. If reviewer/tester returns `FAILED`, the run routes back to coder.
+  Escalates to NEEDS_INPUT after `max_returns`.
+- `cr`: coder -> reviewer. If reviewer returns `FAILED`, the run routes back to coder.
+  Escalates to NEEDS_INPUT after `max_returns`.
+- `c`: coder only.
+- `r`: reviewer only.
+- `t`: tester only.
+- `d`: devops only.
+- `custom`: 1-6 stages, choose templates (`coder/reviewer/tester/devops/custom`) and optionally configure
+  a linear return-on-failure loop.
+
+Run flow:
+- Plan mode (auto/user/none):
+  - `auto`: generate a plan via provider and inject it into INPUTS.md for all steps (skipped for deterministic).
+  - `user`: use a user plan (paste or file path).
+  - `none`: no plan injection.
+- Git safety (branch/check/off), if the workspace is a git repo root:
+  - `branch`: require clean tree (ignores changes under `orchestrator/`), create a run branch, optional auto-commit.
+  - `check`: require clean tree (ignores changes under `orchestrator/`), do not switch branches.
+  - `off`: no git checks.
+- Each step:
+  - Runs the actor, validates REPORT_FORMAT.md, and retries once if the output format is invalid.
+    "attempt 2" means a report-format retry for the same step.
+  - Writes upstream handoff into the next step's `INPUTS.md` (in the run-local packet copy).
+  - If `git safety=branch` and auto-commit is enabled, commits workspace changes (excluding `orchestrator/`).
+
+Progress output:
+- When stderr is a TTY, `run` shows a single-line spinner status on stderr.
+- Otherwise (IDE output panels, logs), it prints periodic `progress:` lines instead.
+
+Delivery (merge request instructions):
+- If `setup` enabled "Merge request at end: instructions" AND the run used `git safety=branch`,
+  the run writes:
+  - `orchestrator/runs/<run_id>/delivery/mr_instructions.md`
+  - `orchestrator/runs/<run_id>/delivery/mr_body.md`
+
+Timeouts:
+- Providers use `timeout_s` (hard wall-clock) and `idle_timeout_s` (no stdout/stderr activity).
+- Set either to `0` to disable it.
+- For long Codex runs, prefer `--timeout-s 0` and keep a reasonable `--idle-timeout-s`.
 
 Providers:
 - `deterministic`: offline provider for predictable runs.
-- `codex_cli`: shells out to a configurable Codex CLI command and parses JSONL from stdout (recommended: `codex exec --json --full-auto`).
+- `codex_cli`: shells out to a configurable Codex CLI command and parses JSONL from stdout.
+  Recommended command: `codex exec --json --full-auto`.
 
 Example (offline):
 
@@ -70,11 +114,8 @@ Run overrides:
     # Disable hard timeout, keep idle timeout at 10 minutes.
     python3 main.py run --workspace /path/to/workspace --timeout-s 0 --idle-timeout-s 600
 
-Checks / lint (stdlib-only):
+Checks:
 
     python3 tools/check.py
-
-Optional (if installed):
-
     python3 tools/check.py --with-ruff
     python3 tools/check.py --with-black
