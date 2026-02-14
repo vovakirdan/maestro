@@ -632,11 +632,15 @@ class SetupResult:
     pipeline_path: Path
 
 
-def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
+def run_interactive_setup(*, workspace_dir: Path, mode: str = "task") -> SetupResult:
+    if mode not in {"task", "ticket"}:
+        raise ValueError("mode must be one of: task, ticket")
+
     workspace_dir = Path(_prompt_line("Workspace path?", default=str(workspace_dir))).expanduser()
     workspace_dir = workspace_dir.resolve()
     orch_root = orchestrator_root(workspace_dir)
     tasks_root = orch_root / "tasks"
+    tickets_root = orch_root / "tickets"
     legacy_pipeline_path = orch_root / "pipeline.json"
     legacy_packets_dir = orch_root / "packets"
     legacy_detected = orch_root.exists() and (
@@ -645,7 +649,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     if legacy_detected:
         print("NOTE: legacy orchestrator config detected at:")
         print(f"- {orch_root}")
-        print("This setup will create a new task under orchestrator/tasks and will not delete legacy files.")
+        print("This setup will create a new control under orchestrator/")
+        print("tasks (task mode) / tickets (ticket mode), and will not delete legacy files.")
         print("")
 
     task_kind = _prompt_choice(
@@ -677,16 +682,20 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     task = TaskConfig(kind=task_kind, details_md=details)
     print("")
 
-    # Create a task-scoped control dir so repeated setups don't overwrite prior work.
-    tasks_root.mkdir(parents=True, exist_ok=True)
+    output_root = tasks_root if mode == "task" else tickets_root
+    current_marker = orch_root / ("CURRENT_TASK" if mode == "task" else "CURRENT_TICKET")
+    label = "Task" if mode == "task" else "Ticket"
+
+    # Create a control dir so repeated setups don't overwrite prior work.
+    output_root.mkdir(parents=True, exist_ok=True)
     task_id_base = _generate_task_id(goal=goal)
     task_id = task_id_base
     i = 2
-    while (tasks_root / task_id).exists():
+    while (output_root / task_id).exists():
         task_id = f"{task_id_base}_{i}"
         i += 1
 
-    orch_dir = tasks_root / task_id
+    orch_dir = output_root / task_id
     packets_dir = orch_dir / "packets"
     runs_dir = orch_dir / "runs"
     pipeline_path = orch_dir / "pipeline.json"
@@ -958,28 +967,31 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
     # Optional: configure how the orchestrator reacts to reviewer findings.
     if orchestration is not None:
-        relevant_actor_ids = [
-            a.actor_id
+        relevant_actor_specs: list[tuple[str, str]] = [
+            (a.actor_id, a.template_id)
             for a in agents
-            if a.template_id in {"reviewer", "manual_tester", "tester"}
+            if a.template_id in {"reviewer", "manual_tester", "tester", "auto_tester"}
         ]
-        if relevant_actor_ids:
+        if relevant_actor_specs:
             existing: dict[str, ReviewReactionPolicy] = {
                 p.actor_id: p for p in orchestration.review_policies
             }
 
-            for actor_id in relevant_actor_ids:
-                mode = _prompt_choice(
+            for actor_id, template_id in relevant_actor_specs:
+                default_mode = "status_failed"
+                if template_id in {"manual_tester", "auto_tester", "tester"}:
+                    default_mode = "escalate"
+                policy_mode = _prompt_choice(
                     f"Reaction policy for {actor_id} (status_failed/any_tag/only_minor/majors_leq_n/escalate)",
                     choices=["status_failed", "any_tag", "only_minor", "majors_leq_n", "escalate"],
-                    default="status_failed",
+                    default=default_mode,
                 )
                 policy: ReviewReactionPolicy | None = None
-                if mode == "status_failed":
+                if policy_mode == "status_failed":
                     existing.pop(actor_id, None)
-                elif mode == "any_tag":
+                elif policy_mode == "any_tag":
                     policy = ReviewReactionPolicy(actor_id=actor_id, trigger="any_tag")
-                elif mode == "only_minor":
+                elif policy_mode == "only_minor":
                     policy = ReviewReactionPolicy(
                         actor_id=actor_id,
                         trigger="any_tag",
@@ -987,7 +999,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                         on_trigger="return",
                         on_overflow="escalate",
                     )
-                elif mode == "majors_leq_n":
+                elif policy_mode == "majors_leq_n":
                     n = _prompt_int(
                         "Max MAJOR findings to return (exceed => escalate)",
                         min_value=0,
@@ -1001,7 +1013,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                         on_trigger="return",
                         on_overflow="escalate",
                     )
-                elif mode == "escalate":
+                elif policy_mode == "escalate":
                     policy = ReviewReactionPolicy(
                         actor_id=actor_id,
                         trigger="status_failed",
@@ -1182,14 +1194,15 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     orch_dir.mkdir(parents=True, exist_ok=False)
     runs_dir.mkdir(parents=True, exist_ok=True)
     packets_dir.mkdir(parents=True, exist_ok=True)
-    (orch_root / "CURRENT_TASK").write_text(task_id + "\n", encoding="utf-8")
-    (orch_dir / "TASK.json").write_text(
+    current_marker.write_text(task_id + "\n", encoding="utf-8")
+    (orch_dir / ("TASK.json" if mode == "task" else "TICKET.json")).write_text(
         json.dumps(
             {
                 "task_id": task_id,
                 "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "goal": goal,
                 "task_kind": task_kind,
+                "mode": mode,
             },
             indent=2,
             sort_keys=True,
@@ -1375,7 +1388,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     print("")
     print("Setup complete.")
     print(f"Workspace: {workspace_dir}")
-    print(f"Task:      {task_id}")
+    print(f"{label}:    {task_id}")
     print(f"Pipeline:  {pipeline_path}")
 
     return SetupResult(

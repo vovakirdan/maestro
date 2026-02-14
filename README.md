@@ -10,6 +10,7 @@ This repo provides:
 Commands:
 
     python3 main.py setup --workspace /path/to/workspace
+    python3 main.py ticket start --workspace /path/to/workspace
     python3 main.py run --workspace /path/to/workspace
     python3 main.py run --workspace /path/to/workspace --task <task_id>
 
@@ -18,9 +19,14 @@ Workspace layout created by `setup`:
     <workspace>/
       orchestrator/
         CURRENT_TASK             # task id used by default in `run`
+        CURRENT_TICKET           # ticket id used by default in `run` if CURRENT_TASK is absent
         tasks/
           <task_id>/
             TASK.json            # task metadata (goal, kind, timestamps)
+            pipeline.json
+        tickets/
+          <ticket_id>/
+            TICKET.json          # ticket metadata (goal, kind, timestamps)
             pipeline.json
             BRIEF.md             # only when AI setup wizard runs
             setup_artifacts/     # provider artifacts from setup wizard runs
@@ -72,11 +78,16 @@ Setup flow:
   - Packet docs are written for isolated agents (no orchestration/other-agent mentions).
   - Setup artifacts are saved under `orchestrator/setup_artifacts/` for debugging.
 - If task type is `bootstrap` and the workspace is not a git repo, setup can optionally run `git init`.
-- Each `setup` creates a new task folder under `orchestrator/tasks/<task_id>/` and updates `orchestrator/CURRENT_TASK`.
+- `setup` creates a task folder under `orchestrator/tasks/<task_id>/` and updates `orchestrator/CURRENT_TASK`.
+- `ticket start` creates a ticket folder under `orchestrator/tickets/<ticket_id>/` and updates `orchestrator/CURRENT_TICKET`.
+- `run` resolves context in this order: `--task`, `CURRENT_TASK`, `CURRENT_TICKET`, single tasks/ candidate, single tickets/ candidate, legacy layout.
 
 Workflow presets:
 - `crt`: coder -> reviewer -> (optional qa_notes) -> manual_tester/auto_tester (choose manual/auto/both).
-  If reviewer/tester returns `FAILED`, the run routes back to coder. Escalates to NEEDS_INPUT after `max_returns`.
+  If reviewer/tester returns `FAILED`, run follows `review_policies`:
+  - by default, configured policies may return to `return_to`, escalate, or ignore findings;
+  - if no policy exists, `manual_tester`/`auto_tester`/`tester` now escalate by default (to avoid blind rework loops).
+  - after configured attempts, escalation still stops with `NEEDS_INPUT`.
 - `cr`: coder -> reviewer. If reviewer returns `FAILED`, the run routes back to coder.
   Escalates to NEEDS_INPUT after `max_returns`.
 - `c`: coder only.

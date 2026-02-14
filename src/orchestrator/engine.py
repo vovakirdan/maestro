@@ -218,12 +218,19 @@ class OrchestratorEngine:
         workspace_dir = workspace_dir.resolve()
         orch_root = orchestrator_root(workspace_dir)
         tasks_root = orch_root / "tasks"
+        tickets_root = orch_root / "tickets"
 
-        def load_task_dir(tid: str) -> OrchestratorEngine:
+        def load_work_dir(tid: str) -> OrchestratorEngine:
             tdir = tasks_root / tid
+            if not tdir.exists():
+                alt_dir = tickets_root / tid
+                if alt_dir.exists():
+                    tdir = alt_dir
+            if not tdir.exists():
+                raise ValueError(f"Task/Ticket not found or missing pipeline.json: {tdir}")
             pipeline_path = tdir / "pipeline.json"
             if not pipeline_path.exists():
-                raise ValueError(f"Task not found or missing pipeline.json: {tdir}")
+                raise ValueError(f"Task/Ticket not found or missing pipeline.json: {tdir}")
             pipeline = load_pipeline(pipeline_path)
             return OrchestratorEngine(
                 workspace_dir=workspace_dir,
@@ -233,13 +240,19 @@ class OrchestratorEngine:
             )
 
         if task_id is not None and task_id.strip():
-            return load_task_dir(task_id.strip())
+            return load_work_dir(task_id.strip())
 
         current_path = orch_root / "CURRENT_TASK"
         if current_path.exists():
             tid = current_path.read_text(encoding="utf-8").strip()
             if tid:
-                return load_task_dir(tid)
+                return load_work_dir(tid)
+
+        current_ticket_path = orch_root / "CURRENT_TICKET"
+        if current_ticket_path.exists():
+            tid = current_ticket_path.read_text(encoding="utf-8").strip()
+            if tid:
+                return load_work_dir(tid)
 
         if tasks_root.exists():
             task_dirs = sorted([p for p in tasks_root.iterdir() if p.is_dir()])
@@ -248,7 +261,16 @@ class OrchestratorEngine:
                 if (p / "pipeline.json").exists():
                     candidates.append(p.name)
             if len(candidates) == 1:
-                return load_task_dir(candidates[0])
+                return load_work_dir(candidates[0])
+
+        if tickets_root.exists():
+            ticket_dirs = sorted([p for p in tickets_root.iterdir() if p.is_dir()])
+            candidates = []
+            for p in ticket_dirs:
+                if (p / "pipeline.json").exists():
+                    candidates.append(p.name)
+            if len(candidates) == 1:
+                return load_work_dir(candidates[0])
 
         # Legacy layout: <workspace>/orchestrator/pipeline.json
         legacy_pipeline_path = orch_root / "pipeline.json"
@@ -265,7 +287,9 @@ class OrchestratorEngine:
             "No pipeline found. Expected one of:\n"
             "- <workspace>/orchestrator/pipeline.json (legacy)\n"
             "- <workspace>/orchestrator/CURRENT_TASK pointing to tasks/<task_id>/pipeline.json\n"
+            "- <workspace>/orchestrator/CURRENT_TICKET pointing to tickets/<ticket_id>/pipeline.json\n"
             "- <workspace>/orchestrator/tasks/<task_id>/pipeline.json (use --task)\n"
+            "- <workspace>/orchestrator/tickets/<ticket_id>/pipeline.json (use --task)\n"
         )
 
     def _make_provider_from_cfg(self, cfg: ActorConfig | ProviderConfig) -> Provider:
@@ -1194,6 +1218,19 @@ class OrchestratorEngine:
             review_policies: dict[str, ReviewReactionPolicy] = {
                 p.actor_id: p for p in orch.review_policies
             }
+            for actor_id in actor_ids:
+                if actor_id not in {"manual_tester", "auto_tester", "tester"}:
+                    continue
+                if actor_id in review_policies:
+                    continue
+                if actor_id not in return_from:
+                    continue
+                review_policies[actor_id] = ReviewReactionPolicy(
+                    actor_id=actor_id,
+                    trigger="status_failed",
+                    on_trigger="escalate",
+                    on_overflow="escalate",
+                )
             returns_used = 0
             invocation_i = 0
             stage_i = 0

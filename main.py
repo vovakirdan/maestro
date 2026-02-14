@@ -16,8 +16,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     setup_p = sub.add_parser("setup", help="Interactive quick setup (creates packets + pipeline).")
+    ticket_p = sub.add_parser("ticket", help="Manage tickets (prepare task presets without running).")
+    ticket_sub = ticket_p.add_subparsers(dest="ticket_cmd", required=True)
+    ticket_start_p = ticket_sub.add_parser("start", help="Create a new ticket and prepare its pipeline.")
     run_p = sub.add_parser("run", help="Run the configured pipeline sequentially.")
-    for sp in (setup_p, run_p):
+    for sp in (setup_p, run_p, ticket_start_p):
         sp.add_argument(
             "--workspace",
             default="workspace",
@@ -56,6 +59,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "setup":
             run_interactive_setup(workspace_dir=workspace_dir)
             return 0
+
+        if args.cmd == "ticket":
+            if args.ticket_cmd == "start":
+                run_interactive_setup(workspace_dir=workspace_dir, mode="ticket")
+                return 0
+            print("Unknown ticket command.", file=sys.stderr)
+            return 2
 
         if args.cmd == "run":
 
