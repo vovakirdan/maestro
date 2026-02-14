@@ -65,6 +65,7 @@ GitMode = Literal["off", "check", "branch"]
 class GitPolicy:
     mode: GitMode = "off"
     branch_prefix: str = "orch/"
+    auto_commit: bool = False
 
 
 @dataclass
@@ -242,6 +243,7 @@ class OrchestratorEngine:
             original_branch = _git_current_branch() or "unknown"
             state["git"] = {
                 "mode": git.mode,
+                "auto_commit": bool(getattr(git, "auto_commit", False)),
                 "repo_root": repo_root.as_posix(),
                 "original_branch": original_branch,
                 "clean": not kept,
@@ -253,6 +255,7 @@ class OrchestratorEngine:
                     "type": "git_checked",
                     "run_id": run_id,
                     "mode": git.mode,
+                    "auto_commit": bool(getattr(git, "auto_commit", False)),
                     "repo_root": repo_root.as_posix(),
                     "original_branch": original_branch,
                 }
@@ -283,6 +286,106 @@ class OrchestratorEngine:
                     }
                 )
                 log(f"git: checked out {active_branch} (original={original_branch})")
+
+        def _git_commit_step(
+            *, step_name: str, actor_id: str, step_dir: Path, label: str
+        ) -> str | None:
+            """
+            Optionally commit workspace changes after a step.
+
+            This is only enabled when git policy is active in "branch" mode and auto_commit=True.
+            Changes under orchestrator/ are always excluded from the commit.
+            """
+            if git is None or git.mode != "branch" or not git.auto_commit:
+                return None
+
+            clean, details = _git_is_clean()
+            _ = clean
+            kept, ignored = _git_filter_status_lines(details, allow_prefixes=("orchestrator/",))
+            if not kept:
+                timeline.append(
+                    {
+                        "type": "git_commit_skipped",
+                        "run_id": run_id,
+                        "step": step_name,
+                        "actor_id": actor_id,
+                        "reason": "no_changes",
+                        "ignored_status_lines": list(ignored),
+                    }
+                )
+                return None
+
+            msg = f"orch:{run_id} {step_name} {actor_id} {label}".strip()
+            p = _run_git(["add", "-A", "--", ".", ":(exclude)orchestrator"])
+            if p.returncode != 0:
+                raise ValueError(f"git add failed: {(p.stderr or p.stdout or '').strip()!r}")
+
+            staged = (_run_git(["diff", "--cached", "--name-only"]).stdout or "").strip()
+            if not staged:
+                timeline.append(
+                    {
+                        "type": "git_commit_skipped",
+                        "run_id": run_id,
+                        "step": step_name,
+                        "actor_id": actor_id,
+                        "reason": "nothing_staged",
+                        "message": msg,
+                    }
+                )
+                return None
+
+            p = _run_git(["commit", "-m", msg])
+            if p.returncode != 0:
+                out = (p.stderr or p.stdout or "").strip()
+                if "nothing to commit" in out.lower():
+                    timeline.append(
+                        {
+                            "type": "git_commit_skipped",
+                            "run_id": run_id,
+                            "step": step_name,
+                            "actor_id": actor_id,
+                            "reason": "nothing_to_commit",
+                            "message": msg,
+                        }
+                    )
+                    return None
+                raise ValueError(f"git commit failed: {out!r}")
+
+            commit = (_run_git(["rev-parse", "HEAD"]).stdout or "").strip()
+            if not commit:
+                raise ValueError("git rev-parse HEAD returned empty after commit")
+
+            changed = (
+                _run_git(["diff-tree", "--no-commit-id", "--name-only", "-r", commit]).stdout
+                or ""
+            ).strip()
+            info: JsonDict = {
+                "commit": commit,
+                "message": msg,
+                "changed_paths": [p for p in changed.splitlines() if p.strip()],
+            }
+            _write_json(step_dir / "commit.json", info)
+
+            # Update state step entry with commit id (best-effort).
+            for entry in reversed(state.get("steps", [])):
+                if isinstance(entry, dict) and entry.get("step") == step_name:
+                    entry["commit"] = commit
+                    break
+            _write_json(state_path, state)
+
+            timeline.append(
+                {
+                    "type": "git_commit_created",
+                    "run_id": run_id,
+                    "step": step_name,
+                    "actor_id": actor_id,
+                    "commit": commit,
+                    "message": msg,
+                    "changed_paths": info["changed_paths"],
+                }
+            )
+            log(f"git: committed {commit[:12]} for {step_name} ({actor_id})")
+            return commit
 
         plan_mode: PlanMode = "none"
         plan_text: str = ""
@@ -607,12 +710,20 @@ class OrchestratorEngine:
                     break
                 final_report = report
                 if report.status == Status.OK:
+                    _commit = _git_commit_step(
+                        step_name=step_name,
+                        actor_id=actor_id,
+                        step_dir=(steps_dir / step_name),
+                        label="ok",
+                    )
                     if i < len(self.pipeline.actors):
                         next_cfg = self.pipeline.actors[i]
                         next_packet_dir = run_packets_dir / next_cfg.packet_dir
                         handoff = "# INPUTS\n\nUpstream report:\n\n" + report.output.rstrip() + "\n"
                         if report.next_inputs.strip():
                             handoff += "\nUpstream handoff:\n\n" + report.next_inputs.rstrip() + "\n"
+                        if _commit:
+                            handoff += "\nCommit:\n" f"- { _commit }\n"
                         write_inputs(next_packet_dir, handoff)
                     continue
 
@@ -631,25 +742,224 @@ class OrchestratorEngine:
                 )
                 break
         else:
-            if orch.preset != "crt_v1":
-                raise ValueError(f"Unsupported orchestration preset: {orch.preset!r}")
-            if len(self.pipeline.actors) != 3:
-                raise ValueError("crt_v1 preset requires exactly 3 actors (coder, reviewer, tester)")
+            if orch.preset == "crt_v1":
+                if len(self.pipeline.actors) != 3:
+                    raise ValueError(
+                        "crt_v1 preset requires exactly 3 actors (coder, reviewer, tester)"
+                    )
 
-            coder_cfg, reviewer_cfg, tester_cfg = self.pipeline.actors
-            max_returns = orch.max_returns
-            returns_used = 0
-            invocation_i = 0
+                coder_cfg, reviewer_cfg, tester_cfg = self.pipeline.actors
+                max_returns = orch.max_returns
+                returns_used = 0
+                invocation_i = 0
 
-            last_impl: StructuredReport | None = None
+                last_impl: StructuredReport | None = None
+                last_commit: str | None = None
 
-            next_role = "coder"
-            while True:
-                invocation_i += 1
+                next_role = "coder"
+                while True:
+                    invocation_i += 1
 
-                if next_role == "coder":
+                    if next_role == "coder":
+                        step_name, actor_id, report, text, _errors = run_invocation(
+                            invocation_i, coder_cfg
+                        )
+                        final_text = text
+                        if report is None:
+                            overall_status = Status.FAILED
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "invalid_report_format",
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+                        final_report = report
+                        if report.status != Status.OK:
+                            overall_status = report.status
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+                        last_impl = report
+                        commit = _git_commit_step(
+                            step_name=step_name,
+                            actor_id=actor_id,
+                            step_dir=(steps_dir / step_name),
+                            label="implementation",
+                        )
+                        if commit:
+                            last_commit = commit
+
+                        reviewer_packet_dir = run_packets_dir / reviewer_cfg.packet_dir
+                        handoff = (
+                            "# INPUTS\n\nImplementation report:\n\n" + report.output.rstrip() + "\n"
+                        )
+                        if report.next_inputs.strip():
+                            handoff += "\nValidation notes:\n\n" + report.next_inputs.rstrip() + "\n"
+                        if last_commit:
+                            handoff += (
+                                "\nCommit:\n"
+                                f"- {last_commit}\n"
+                                "\nSuggested review commands:\n"
+                                f"- git show --stat {last_commit}\n"
+                                f"- git show {last_commit}\n"
+                            )
+                        handoff += "\nWorkspace:\n- Inspect the workspace for the actual changes.\n"
+                        write_inputs(reviewer_packet_dir, handoff)
+                        next_role = "reviewer"
+                        continue
+
+                    if next_role == "reviewer":
+                        step_name, actor_id, report, text, _errors = run_invocation(
+                            invocation_i, reviewer_cfg
+                        )
+                        final_text = text
+                        if report is None:
+                            overall_status = Status.FAILED
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "invalid_report_format",
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+                        final_report = report
+                        if report.status == Status.NEEDS_INPUT:
+                            overall_status = Status.NEEDS_INPUT
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+
+                        if report.status == Status.OK:
+                            tester_packet_dir = run_packets_dir / tester_cfg.packet_dir
+                            parts: list[str] = ["# INPUTS", ""]
+                            if last_commit:
+                                parts.append("Commit:")
+                                parts.append(f"- {last_commit}")
+                                parts.append("")
+                            if last_impl is not None:
+                                parts.append("Implementation report:")
+                                parts.append("")
+                                parts.append(last_impl.output.rstrip())
+                                parts.append("")
+                                if last_impl.next_inputs.strip():
+                                    parts.append("Implementation handoff:")
+                                    parts.append("")
+                                    parts.append(last_impl.next_inputs.rstrip())
+                                    parts.append("")
+                            parts.append("Review report:")
+                            parts.append("")
+                            parts.append(report.output.rstrip())
+                            parts.append("")
+                            if report.next_inputs.strip():
+                                parts.append("Suggested focus:")
+                                parts.append("")
+                                parts.append(report.next_inputs.rstrip())
+                                parts.append("")
+                            parts.append("Workspace:")
+                            parts.append("- Inspect the workspace for the actual changes.")
+                            write_inputs(tester_packet_dir, "\n".join(parts).rstrip() + "\n")
+                            next_role = "tester"
+                            continue
+
+                        # FAILED: return to coder with feedback, subject to max_returns.
+                        returns_used += 1
+                        if returns_used > max_returns:
+                            overall_status = Status.NEEDS_INPUT
+                            msg = (
+                                "Escalation: exceeded max returns in preset crt_v1.\n"
+                                f"returns_used={returns_used} max_returns={max_returns}\n"
+                            )
+                            final_report = StructuredReport(
+                                status=Status.NEEDS_INPUT,
+                                output=msg,
+                                next_inputs=report.next_inputs or report.output,
+                                artifacts=(),
+                            )
+                            final_text = json.dumps(
+                                {
+                                    "status": final_report.status.value,
+                                    "output": final_report.output,
+                                    "next_inputs": final_report.next_inputs,
+                                    "artifacts": list(final_report.artifacts),
+                                },
+                                indent=2,
+                                sort_keys=True,
+                            ) + "\n"
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "max_returns_exceeded",
+                                    "returns_used": returns_used,
+                                    "max_returns": max_returns,
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+
+                        coder_packet_dir = run_packets_dir / coder_cfg.packet_dir
+                        fb = ["# INPUTS", ""]
+                        if last_commit:
+                            fb.append("Commit under review:")
+                            fb.append(f"- {last_commit}")
+                            fb.append("")
+                        fb.append("Feedback:")
+                        fb.append("")
+                        fb.append(report.output.rstrip())
+                        fb.append("")
+                        if report.next_inputs.strip():
+                            fb.append("Requested changes:")
+                            fb.append("")
+                            fb.append(report.next_inputs.rstrip())
+                            fb.append("")
+                        fb.append(f"Return count: {returns_used}/{max_returns}")
+                        write_inputs(coder_packet_dir, "\n".join(fb).rstrip() + "\n")
+                        next_role = "coder"
+                        continue
+
+                    # tester
                     step_name, actor_id, report, text, _errors = run_invocation(
-                        invocation_i, coder_cfg
+                        invocation_i, tester_cfg
                     )
                     final_text = text
                     if report is None:
@@ -669,54 +979,9 @@ class OrchestratorEngine:
                         )
                         break
                     final_report = report
-                    if report.status != Status.OK:
-                        overall_status = report.status
-                        state["status"] = overall_status.value
-                        state["finished_at_utc"] = _now_iso_utc()
-                        _write_json(state_path, state)
-                        timeline.append(
-                            {
-                                "type": "run_stopped",
-                                "run_id": run_id,
-                                "status": overall_status.value,
-                                "step": step_name,
-                                "actor_id": actor_id,
-                            }
-                        )
+                    if report.status == Status.OK:
+                        overall_status = Status.OK
                         break
-                    last_impl = report
-
-                    reviewer_packet_dir = run_packets_dir / reviewer_cfg.packet_dir
-                    handoff = "# INPUTS\n\nImplementation report:\n\n" + report.output.rstrip() + "\n"
-                    if report.next_inputs.strip():
-                        handoff += "\nValidation notes:\n\n" + report.next_inputs.rstrip() + "\n"
-                    handoff += "\nWorkspace:\n- Inspect the workspace for the actual changes.\n"
-                    write_inputs(reviewer_packet_dir, handoff)
-                    next_role = "reviewer"
-                    continue
-
-                if next_role == "reviewer":
-                    step_name, actor_id, report, text, _errors = run_invocation(
-                        invocation_i, reviewer_cfg
-                    )
-                    final_text = text
-                    if report is None:
-                        overall_status = Status.FAILED
-                        state["status"] = overall_status.value
-                        state["finished_at_utc"] = _now_iso_utc()
-                        _write_json(state_path, state)
-                        timeline.append(
-                            {
-                                "type": "run_stopped",
-                                "run_id": run_id,
-                                "status": overall_status.value,
-                                "reason": "invalid_report_format",
-                                "step": step_name,
-                                "actor_id": actor_id,
-                            }
-                        )
-                        break
-                    final_report = report
                     if report.status == Status.NEEDS_INPUT:
                         overall_status = Status.NEEDS_INPUT
                         state["status"] = overall_status.value
@@ -732,34 +997,6 @@ class OrchestratorEngine:
                             }
                         )
                         break
-
-                    if report.status == Status.OK:
-                        tester_packet_dir = run_packets_dir / tester_cfg.packet_dir
-                        parts: list[str] = ["# INPUTS", ""]
-                        if last_impl is not None:
-                            parts.append("Implementation report:")
-                            parts.append("")
-                            parts.append(last_impl.output.rstrip())
-                            parts.append("")
-                            if last_impl.next_inputs.strip():
-                                parts.append("Implementation handoff:")
-                                parts.append("")
-                                parts.append(last_impl.next_inputs.rstrip())
-                                parts.append("")
-                        parts.append("Review report:")
-                        parts.append("")
-                        parts.append(report.output.rstrip())
-                        parts.append("")
-                        if report.next_inputs.strip():
-                            parts.append("Suggested focus:")
-                            parts.append("")
-                            parts.append(report.next_inputs.rstrip())
-                            parts.append("")
-                        parts.append("Workspace:")
-                        parts.append("- Inspect the workspace for the actual changes.")
-                        write_inputs(tester_packet_dir, "\n".join(parts).rstrip() + "\n")
-                        next_role = "tester"
-                        continue
 
                     # FAILED: return to coder with feedback, subject to max_returns.
                     returns_used += 1
@@ -804,6 +1041,200 @@ class OrchestratorEngine:
 
                     coder_packet_dir = run_packets_dir / coder_cfg.packet_dir
                     fb = ["# INPUTS", ""]
+                    if last_commit:
+                        fb.append("Commit under test:")
+                        fb.append(f"- {last_commit}")
+                        fb.append("")
+                    fb.append("Feedback:")
+                    fb.append("")
+                    fb.append(report.output.rstrip())
+                    fb.append("")
+                    if report.next_inputs.strip():
+                        fb.append("Repro / failing scenarios:")
+                        fb.append("")
+                        fb.append(report.next_inputs.rstrip())
+                        fb.append("")
+                    fb.append(f"Return count: {returns_used}/{max_returns}")
+                    write_inputs(coder_packet_dir, "\n".join(fb).rstrip() + "\n")
+                    next_role = "coder"
+                    continue
+
+            elif orch.preset == "cr_v1":
+                if len(self.pipeline.actors) != 2:
+                    raise ValueError("cr_v1 preset requires exactly 2 actors (coder, reviewer)")
+
+                coder_cfg, reviewer_cfg = self.pipeline.actors
+                max_returns = orch.max_returns
+                returns_used = 0
+                invocation_i = 0
+
+                last_impl: StructuredReport | None = None
+                last_commit: str | None = None
+
+                next_role = "coder"
+                while True:
+                    invocation_i += 1
+
+                    if next_role == "coder":
+                        step_name, actor_id, report, text, _errors = run_invocation(
+                            invocation_i, coder_cfg
+                        )
+                        final_text = text
+                        if report is None:
+                            overall_status = Status.FAILED
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "invalid_report_format",
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+                        final_report = report
+                        if report.status != Status.OK:
+                            overall_status = report.status
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+
+                        last_impl = report
+                        commit = _git_commit_step(
+                            step_name=step_name,
+                            actor_id=actor_id,
+                            step_dir=(steps_dir / step_name),
+                            label="implementation",
+                        )
+                        if commit:
+                            last_commit = commit
+
+                        reviewer_packet_dir = run_packets_dir / reviewer_cfg.packet_dir
+                        handoff = (
+                            "# INPUTS\n\nImplementation report:\n\n" + report.output.rstrip() + "\n"
+                        )
+                        if report.next_inputs.strip():
+                            handoff += "\nValidation notes:\n\n" + report.next_inputs.rstrip() + "\n"
+                        if last_commit:
+                            handoff += (
+                                "\nCommit:\n"
+                                f"- {last_commit}\n"
+                                "\nSuggested review commands:\n"
+                                f"- git show --stat {last_commit}\n"
+                                f"- git show {last_commit}\n"
+                            )
+                        handoff += "\nWorkspace:\n- Inspect the workspace for the actual changes.\n"
+                        write_inputs(reviewer_packet_dir, handoff)
+                        next_role = "reviewer"
+                        continue
+
+                    # reviewer
+                    step_name, actor_id, report, text, _errors = run_invocation(
+                        invocation_i, reviewer_cfg
+                    )
+                    final_text = text
+                    if report is None:
+                        overall_status = Status.FAILED
+                        state["status"] = overall_status.value
+                        state["finished_at_utc"] = _now_iso_utc()
+                        _write_json(state_path, state)
+                        timeline.append(
+                            {
+                                "type": "run_stopped",
+                                "run_id": run_id,
+                                "status": overall_status.value,
+                                "reason": "invalid_report_format",
+                                "step": step_name,
+                                "actor_id": actor_id,
+                            }
+                        )
+                        break
+                    final_report = report
+                    if report.status == Status.OK:
+                        overall_status = Status.OK
+                        break
+                    if report.status == Status.NEEDS_INPUT:
+                        overall_status = Status.NEEDS_INPUT
+                        state["status"] = overall_status.value
+                        state["finished_at_utc"] = _now_iso_utc()
+                        _write_json(state_path, state)
+                        timeline.append(
+                            {
+                                "type": "run_stopped",
+                                "run_id": run_id,
+                                "status": overall_status.value,
+                                "step": step_name,
+                                "actor_id": actor_id,
+                            }
+                        )
+                        break
+
+                    # FAILED: return to coder with feedback, subject to max_returns.
+                    returns_used += 1
+                    if returns_used > max_returns:
+                        overall_status = Status.NEEDS_INPUT
+                        msg = (
+                            "Escalation: exceeded max returns in preset cr_v1.\n"
+                            f"returns_used={returns_used} max_returns={max_returns}\n"
+                        )
+                        final_report = StructuredReport(
+                            status=Status.NEEDS_INPUT,
+                            output=msg,
+                            next_inputs=report.next_inputs or report.output,
+                            artifacts=(),
+                        )
+                        final_text = json.dumps(
+                            {
+                                "status": final_report.status.value,
+                                "output": final_report.output,
+                                "next_inputs": final_report.next_inputs,
+                                "artifacts": list(final_report.artifacts),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        ) + "\n"
+                        state["status"] = overall_status.value
+                        state["finished_at_utc"] = _now_iso_utc()
+                        _write_json(state_path, state)
+                        timeline.append(
+                            {
+                                "type": "run_stopped",
+                                "run_id": run_id,
+                                "status": overall_status.value,
+                                "reason": "max_returns_exceeded",
+                                "returns_used": returns_used,
+                                "max_returns": max_returns,
+                                "step": step_name,
+                                "actor_id": actor_id,
+                            }
+                        )
+                        break
+
+                    coder_packet_dir = run_packets_dir / coder_cfg.packet_dir
+                    fb = ["# INPUTS", ""]
+                    if last_commit:
+                        fb.append("Commit under review:")
+                        fb.append(f"- {last_commit}")
+                        fb.append("")
+                    if last_impl is not None:
+                        fb.append("Implementation report (for reference):")
+                        fb.append("")
+                        fb.append(last_impl.output.rstrip())
+                        fb.append("")
                     fb.append("Feedback:")
                     fb.append("")
                     fb.append(report.output.rstrip())
@@ -818,101 +1249,8 @@ class OrchestratorEngine:
                     next_role = "coder"
                     continue
 
-                # tester
-                step_name, actor_id, report, text, _errors = run_invocation(invocation_i, tester_cfg)
-                final_text = text
-                if report is None:
-                    overall_status = Status.FAILED
-                    state["status"] = overall_status.value
-                    state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
-                    timeline.append(
-                        {
-                            "type": "run_stopped",
-                            "run_id": run_id,
-                            "status": overall_status.value,
-                            "reason": "invalid_report_format",
-                            "step": step_name,
-                            "actor_id": actor_id,
-                        }
-                    )
-                    break
-                final_report = report
-                if report.status == Status.OK:
-                    overall_status = Status.OK
-                    break
-                if report.status == Status.NEEDS_INPUT:
-                    overall_status = Status.NEEDS_INPUT
-                    state["status"] = overall_status.value
-                    state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
-                    timeline.append(
-                        {
-                            "type": "run_stopped",
-                            "run_id": run_id,
-                            "status": overall_status.value,
-                            "step": step_name,
-                            "actor_id": actor_id,
-                        }
-                    )
-                    break
-
-                # FAILED: return to coder with feedback, subject to max_returns.
-                returns_used += 1
-                if returns_used > max_returns:
-                    overall_status = Status.NEEDS_INPUT
-                    msg = (
-                        "Escalation: exceeded max returns in preset crt_v1.\n"
-                        f"returns_used={returns_used} max_returns={max_returns}\n"
-                    )
-                    final_report = StructuredReport(
-                        status=Status.NEEDS_INPUT,
-                        output=msg,
-                        next_inputs=report.next_inputs or report.output,
-                        artifacts=(),
-                    )
-                    final_text = json.dumps(
-                        {
-                            "status": final_report.status.value,
-                            "output": final_report.output,
-                            "next_inputs": final_report.next_inputs,
-                            "artifacts": list(final_report.artifacts),
-                        },
-                        indent=2,
-                        sort_keys=True,
-                    ) + "\n"
-                    state["status"] = overall_status.value
-                    state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
-                    timeline.append(
-                        {
-                            "type": "run_stopped",
-                            "run_id": run_id,
-                            "status": overall_status.value,
-                            "reason": "max_returns_exceeded",
-                            "returns_used": returns_used,
-                            "max_returns": max_returns,
-                            "step": step_name,
-                            "actor_id": actor_id,
-                        }
-                    )
-                    break
-
-                coder_packet_dir = run_packets_dir / coder_cfg.packet_dir
-                fb = ["# INPUTS", ""]
-                fb.append("Feedback:")
-                fb.append("")
-                fb.append(report.output.rstrip())
-                fb.append("")
-                if report.next_inputs.strip():
-                    fb.append("Repro / failing scenarios:")
-                    fb.append("")
-                    fb.append(report.next_inputs.rstrip())
-                    fb.append("")
-                fb.append(f"Return count: {returns_used}/{max_returns}")
-                write_inputs(coder_packet_dir, "\n".join(fb).rstrip() + "\n")
-                next_role = "coder"
-                continue
+            else:
+                raise ValueError(f"Unsupported orchestration preset: {orch.preset!r}")
 
         if overall_status == Status.OK:
             state["status"] = overall_status.value

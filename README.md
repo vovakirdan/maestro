@@ -13,6 +13,8 @@ Timeouts:
 Setup presets:
 - `crt` (coder -> reviewer -> tester): runs reviewer/tester validation and routes FAILED feedback back to coder.
   Stops and escalates after `max_returns` returns to the coder.
+- `cr` (coder -> reviewer): runs reviewer validation and routes FAILED feedback back to coder.
+  Stops and escalates after `max_returns` returns to the coder.
 
 Setup also asks for a task type:
 - `feature`: prioritize backwards-compatibility and regression protection.
@@ -28,6 +30,9 @@ Before `run`, the CLI can also apply a git safety policy (if the workspace is a 
 - `branch`: require a clean working tree and checkout a new branch `orch/<run_id>` (configurable prefix).
 - `check`: require a clean working tree but do not switch branches.
 - `off`: no git checks.
+
+When `Git safety=branch`, the CLI can also auto-commit after coder steps (optional). This makes review loops
+more pragmatic by turning each coder output into a concrete commit for the reviewer to inspect.
 
 Workspace layout created by `setup`:
 

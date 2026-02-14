@@ -10,7 +10,7 @@ from typing import Any, Literal
 from src.core.types import JsonDict
 
 ProviderType = Literal["deterministic", "codex_cli"]
-PresetType = Literal["crt_v1"]
+PresetType = Literal["crt_v1", "cr_v1"]
 TaskKind = Literal["feature", "bug", "bootstrap"]
 
 
@@ -116,8 +116,12 @@ class OrchestrationConfig:
         preset = obj.get("preset")
         if preset == "crt":
             preset = "crt_v1"
-        if preset not in ("crt_v1",):
-            raise ValueError(f"orchestration.preset must be 'crt_v1', got: {preset!r}")
+        if preset == "cr":
+            preset = "cr_v1"
+        if preset not in ("crt_v1", "cr_v1"):
+            raise ValueError(
+                "orchestration.preset must be 'crt_v1' or 'cr_v1', got: " f"{preset!r}"
+            )
         max_returns_raw = obj.get("max_returns", 3)
         try:
             max_returns = int(max_returns_raw)

@@ -323,9 +323,22 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     if git_mode != "off":
                         prefix = ""
+                        auto_commit = False
                         if git_mode == "branch":
                             prefix = input("Git branch prefix [orch/]: ").strip() or "orch/"
-                        git_policy = GitPolicy(mode=git_mode, branch_prefix=prefix or "orch/")
+                            auto_commit = (
+                                _prompt_choice(
+                                    "Auto-commit after coder steps? (y/n)",
+                                    choices=["y", "n"],
+                                    default="y",
+                                )
+                                == "y"
+                            )
+                        git_policy = GitPolicy(
+                            mode=git_mode,
+                            branch_prefix=prefix or "orch/",
+                            auto_commit=auto_commit,
+                        )
 
             outcome = engine.run(
                 progress=ui.log_line,

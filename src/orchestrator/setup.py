@@ -594,8 +594,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     print("")
 
     preset = _prompt_choice(
-        "Orchestration preset (crt/custom)",
-        choices=["crt", "custom"],
+        "Orchestration preset (crt/cr/custom)",
+        choices=["crt", "cr", "custom"],
         default="crt",
     )
     max_returns = 3
@@ -607,6 +607,14 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             default=3,
         )
         num_agents = 3
+    elif preset == "cr":
+        max_returns = _prompt_int(
+            "Max returns (review -> coder)",
+            min_value=0,
+            max_value=10,
+            default=3,
+        )
+        num_agents = 2
     else:
         num_agents = _prompt_int(
             "How many agents do you want? (2-4)", min_value=2, max_value=4, default=2
@@ -655,6 +663,18 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     agents: list[AgentSpec] = []
     if preset == "crt":
         for template_id in ("coder", "reviewer", "tester"):
+            actor_id = template_id
+            specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
+            agents.append(
+                AgentSpec(
+                    actor_id=actor_id,
+                    template_id=template_id,
+                    specialization=specialization,
+                    custom_role="",
+                )
+            )
+    elif preset == "cr":
+        for template_id in ("coder", "reviewer"):
             actor_id = template_id
             specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
             agents.append(
@@ -772,6 +792,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     orchestration = None
     if preset == "crt":
         orchestration = OrchestrationConfig(preset="crt_v1", max_returns=max_returns)
+    elif preset == "cr":
+        orchestration = OrchestrationConfig(preset="cr_v1", max_returns=max_returns)
     pipeline = PipelineConfig(
         version=1,
         provider=provider_cfg,
