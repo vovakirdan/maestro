@@ -34,6 +34,11 @@ def _target_coder(goal: str, actor_id: str, upstream_actor_id: str | None) -> st
         "  - what to review/test\n"
         "  - suggested validation steps\n"
         "  - any known limitations\n"
+        "\n"
+        "If you cannot complete the task:\n"
+        '- Use status="NEEDS_INPUT".\n'
+        "- In next_inputs, ask precise questions and provide options.\n"
+        "- Do not guess or proceed with fabricated assumptions.\n"
     )
 
 
@@ -164,7 +169,23 @@ _CODER = RoleTemplate(
         "- If you make assumptions, list them and note the impact.\n\n"
         "When blocked:\n"
         '- If a user decision or missing information is required, use status="NEEDS_INPUT".\n'
-        "- Ask focused questions and provide options.\n\n"
+        "- Do not proceed on guesswork when requirements, environment, or access are unclear.\n"
+        "- If the request is infeasible under the current constraints, stop and ask to adjust scope.\n"
+        "- Common blockers that MUST trigger NEEDS_INPUT:\n"
+        "  - missing acceptance criteria / ambiguity in expected behavior\n"
+        "  - missing repo access, secrets, credentials, or permissions\n"
+        "  - missing prerequisites (toolchain, SDKs) where installs are not allowed\n"
+        "  - build/test failures that must be investigated by a human (environment-specific)\n"
+        "  - upstream dependency/contract unknowns that require a decision\n"
+        "- In next_inputs, use this structure:\n"
+        "  - Blocked because: <1-3 bullets>\n"
+        "  - What I checked: <bullets, include file paths/commands when relevant>\n"
+        "  - Questions (answer each): <numbered list>\n"
+        "  - Options:\n"
+        "    1) <recommended option>\n"
+        "    2) <alternative>\n"
+        "    3) <alternative>\n"
+        "  - If you want me to proceed, I need: <minimum inputs>\n\n"
         "Output:\n"
         "- Output must match REPORT_FORMAT exactly (one JSON object, no extra text).\n"
         "- Reference concrete file paths in output.\n"

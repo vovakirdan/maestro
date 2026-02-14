@@ -30,6 +30,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Override provider hard timeout seconds (0 disables hard timeout).",
     )
     run_p.add_argument(
+        "--task",
+        default=None,
+        help="Task id under <workspace>/orchestrator/tasks/<task_id> (default: CURRENT_TASK or legacy pipeline).",
+    )
+    run_p.add_argument(
         "--idle-timeout-s",
         type=float,
         default=None,
@@ -276,7 +281,7 @@ def main(argv: list[str] | None = None) -> int:
                     lines.append(line)
                 return "\n".join(lines).strip()
 
-            engine = OrchestratorEngine.load(workspace_dir=workspace_dir)
+            engine = OrchestratorEngine.load(workspace_dir=workspace_dir, task_id=args.task)
             total_steps: int | None
             if engine.pipeline.orchestration is None:
                 total_steps = len(engine.pipeline.actors)
@@ -357,6 +362,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Status: {outcome.status.value}")
             print(f"Dir:    {outcome.run_dir}")
             print("")
+            if outcome.status == Status.NEEDS_INPUT:
+                ni_path = outcome.run_dir / "NEEDS_INPUT.md"
+                if ni_path.exists():
+                    print(f"NEEDS_INPUT file: {ni_path}")
+                esc_path = outcome.run_dir / "escalation" / "escalation.md"
+                if esc_path.exists():
+                    print(f"Escalation file: {esc_path}")
+                if ni_path.exists() or esc_path.exists():
+                    print("")
             if outcome.final_report is not None:
                 print(outcome.final_report.output.rstrip())
                 if (

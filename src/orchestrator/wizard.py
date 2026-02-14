@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.core.runtime import DeliveryConfig, GitDefaultsConfig, OrchestrationConfig, TaskConfig
-from src.core.types import JsonDict
+from src.core.types import JsonDict, StructuredReport
 from src.orchestrator.spec import AgentSpec
 from src.providers.base import Provider
 
@@ -345,3 +345,106 @@ def run_setup_wizard_write_packet(
         "INPUTS": obj["inputs_md"].rstrip() + "\n",
     }
     return WizardPacketResult(docs=docs), res.metadata
+
+
+@dataclass(frozen=True)
+class EscalationWizardResult:
+    escalation_md: str
+
+
+def run_escalation_wizard(
+    provider: Provider,
+    *,
+    workspace_dir: Path,
+    goal: str,
+    task: TaskConfig | None,
+    run_id: str,
+    step: str,
+    actor_id: str,
+    reason: str,
+    report: StructuredReport,
+    inputs_md: str,
+    last_commit: str | None,
+    returns_used: int | None,
+    max_returns: int | None,
+    artifacts_dir: Path,
+    timeout_s: float,
+    idle_timeout_s: float,
+    on_event: Callable[[JsonDict], None] | None = None,
+) -> tuple[EscalationWizardResult | None, JsonDict]:
+    """
+    Escalation wizard (AI): when the run stops with NEEDS_INPUT, produce a user-facing
+    resolution proposal (questions, options, suggested subtasks).
+
+    Returns (result_or_none, provider_metadata).
+    """
+    task_kind = task.kind if task is not None else "other"
+    task_details = task.details_md.strip() if task is not None else ""
+    details_block = f"Task details:\n{task_details}\n\n" if task_details else ""
+    commit_block = f"- last_commit: {last_commit}\n" if last_commit else ""
+
+    returns_block = ""
+    if returns_used is not None and max_returns is not None:
+        returns_block = f"- returns_used: {returns_used}\n- max_returns: {max_returns}\n"
+
+    prompt = "".join(
+        [
+            "You are an escalation assistant for a local multi-agent orchestration run.\n\n",
+            "Your goal: help a human unblock the run by proposing the smallest set of actions/answers.\n\n",
+            "Hard constraints:\n",
+            "- Read-only workspace inspection: do not modify files.\n",
+            "- Do not suggest destructive commands (no rm -rf, no installs).\n",
+            "- Use ASCII only.\n",
+            "- Do not output markdown fences.\n\n",
+            "Context:\n",
+            f"- workspace_root: {workspace_dir.as_posix()}\n",
+            f"- run_id: {run_id}\n",
+            f"- step: {step}\n",
+            f"- actor_id: {actor_id}\n",
+            f"- reason: {reason}\n",
+            commit_block,
+            returns_block,
+            "\n",
+            f"Task type: {task_kind}\n\n",
+            details_block,
+            "Goal:\n",
+            f"{goal.strip() or '(no goal provided)'}\n\n",
+            "Agent report (validated):\n",
+            f"- status: {report.status.value}\n\n",
+            "output:\n",
+            (report.output or "").rstrip() + "\n\n",
+            "next_inputs (agent questions / missing info):\n",
+            (report.next_inputs or "").rstrip() + "\n\n",
+            "INPUTS.md for this step (may include upstream info / plan):\n",
+            inputs_md.rstrip() + "\n\n",
+            "Output:\n",
+            "Return exactly one JSON object with keys:\n",
+            "- escalation_md (markdown string)\n",
+            "No extra keys. escalation_md must be a non-empty string.\n\n",
+            "Content requirements for escalation_md:\n",
+            "- Start with a short summary of what is blocked and why.\n",
+            "- Provide a Questions section with a numbered list; each item should be answerable.\n",
+            "- Provide an Options section with 2-4 options (recommended first).\n",
+            "- Provide a Suggested subtasks section (bullets) if splitting work would help.\n",
+            "- Provide a Suggested INPUTS.md update section: a copy-pastable block the user can paste.\n",
+        ]
+    )
+
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    (artifacts_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+
+    res = provider.run(
+        prompt,
+        artifacts_dir=artifacts_dir,
+        timeout_s=timeout_s,
+        idle_timeout_s=idle_timeout_s,
+        on_event=on_event,
+    )
+
+    obj = _extract_first_json_object(res.final_text)
+    if not isinstance(obj, dict) or set(obj.keys()) != {"escalation_md"}:
+        return None, res.metadata
+    esc = obj.get("escalation_md")
+    if not isinstance(esc, str) or not esc.strip():
+        return None, res.metadata
+    return EscalationWizardResult(escalation_md=esc.rstrip() + "\n"), res.metadata

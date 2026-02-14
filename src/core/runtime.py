@@ -461,6 +461,7 @@ class PipelineConfig:
     version: int
     provider: ProviderConfig
     actors: tuple[ActorConfig, ...]
+    wizard_provider: ProviderConfig | None = None
     orchestration: OrchestrationConfig | None = None
     goal: str | None = None
     task: TaskConfig | None = None
@@ -473,6 +474,8 @@ class PipelineConfig:
             "provider": self.provider.to_dict(),
             "actors": [a.to_dict() for a in self.actors],
         }
+        if self.wizard_provider is not None:
+            d["wizard_provider"] = self.wizard_provider.to_dict()
         if self.orchestration is not None:
             d["orchestration"] = self.orchestration.to_dict()
         if self.goal is not None and self.goal.strip():
@@ -494,6 +497,12 @@ class PipelineConfig:
         if not isinstance(prov_raw, dict):
             raise ValueError("pipeline.provider must be an object")
         provider = ProviderConfig.from_dict(prov_raw)
+        wizard_raw = obj.get("wizard_provider")
+        wizard_provider: ProviderConfig | None = None
+        if wizard_raw is not None:
+            if not isinstance(wizard_raw, dict):
+                raise ValueError("pipeline.wizard_provider must be an object")
+            wizard_provider = ProviderConfig.from_dict(wizard_raw)
         actors_raw = obj.get("actors")
         if not isinstance(actors_raw, list) or not actors_raw:
             raise ValueError("pipeline.actors must be a non-empty list")
@@ -528,6 +537,7 @@ class PipelineConfig:
         return PipelineConfig(
             version=version,
             provider=provider,
+            wizard_provider=wizard_provider,
             actors=actors,
             orchestration=orchestration,
             goal=goal,

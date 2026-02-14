@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,6 +36,23 @@ from src.providers.claude_cli import ClaudeCLIProvider
 from src.providers.codex_cli import CodexCLIProvider
 from src.providers.deterministic import DeterministicProvider
 from src.providers.gemini_cli import GeminiCLIProvider
+
+
+_RE_TASK_SLUG_SAFE = re.compile(r"[^a-z0-9._-]+")
+
+
+def _sanitize_task_slug(value: str) -> str:
+    v = value.strip().lower().replace(" ", "-")
+    v = _RE_TASK_SLUG_SAFE.sub("-", v)
+    v = re.sub(r"-{2,}", "-", v).strip("-")
+    return v[:40] if v else "task"
+
+
+def _generate_task_id(*, goal: str) -> str:
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    slug = _sanitize_task_slug(goal)
+    suffix = uuid.uuid4().hex[:6]
+    return f"{ts}_{slug}_{suffix}"
 
 
 def _prompt_line(label: str, *, default: str | None = None) -> str:
@@ -593,30 +612,18 @@ class SetupResult:
 def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     workspace_dir = Path(_prompt_line("Workspace path?", default=str(workspace_dir))).expanduser()
     workspace_dir = workspace_dir.resolve()
-    orch_dir = orchestrator_root(workspace_dir)
-    packets_dir = orch_dir / "packets"
-    runs_dir = orch_dir / "runs"
-    pipeline_path = orch_dir / "pipeline.json"
-
-    if orch_dir.exists() and (pipeline_path.exists() or packets_dir.exists()):
-        overwrite = _prompt_yes_no(
-            "Overwrite existing orchestrator config?",
-            default=False,
-        )
-        if not overwrite:
-            print("Setup aborted (no changes made).")
-            return SetupResult(
-                workspace_dir=workspace_dir,
-                orchestrator_dir=orch_dir,
-                pipeline_path=pipeline_path,
-            )
-        if packets_dir.exists():
-            shutil.rmtree(packets_dir)
-
-    print("Quick setup will create:")
-    print(f"- {packets_dir}")
-    print(f"- {runs_dir}")
-    print("")
+    orch_root = orchestrator_root(workspace_dir)
+    tasks_root = orch_root / "tasks"
+    legacy_pipeline_path = orch_root / "pipeline.json"
+    legacy_packets_dir = orch_root / "packets"
+    legacy_detected = orch_root.exists() and (
+        legacy_pipeline_path.exists() or legacy_packets_dir.exists()
+    )
+    if legacy_detected:
+        print("NOTE: legacy orchestrator config detected at:")
+        print(f"- {orch_root}")
+        print("This setup will create a new task under orchestrator/tasks and will not delete legacy files.")
+        print("")
 
     task_kind = _prompt_choice(
         "Task type (feature/bug/bootstrap/other)",
@@ -645,6 +652,27 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         print("Task details hint (optional): constraints, acceptance criteria, non-goals, risks.")
     details = _prompt_multiline_optional("Task details")
     task = TaskConfig(kind=task_kind, details_md=details)
+    print("")
+
+    # Create a task-scoped control dir so repeated setups don't overwrite prior work.
+    tasks_root.mkdir(parents=True, exist_ok=True)
+    task_id_base = _generate_task_id(goal=goal)
+    task_id = task_id_base
+    i = 2
+    while (tasks_root / task_id).exists():
+        task_id = f"{task_id_base}_{i}"
+        i += 1
+
+    orch_dir = tasks_root / task_id
+    packets_dir = orch_dir / "packets"
+    runs_dir = orch_dir / "runs"
+    pipeline_path = orch_dir / "pipeline.json"
+
+    print("Quick setup will create:")
+    print(f"- {orch_dir}")
+    print(f"  - {packets_dir.name}/")
+    print(f"  - {runs_dir.name}/")
+    print(f"  - {pipeline_path.name}")
     print("")
 
     if task_kind == "bootstrap" and not (workspace_dir / ".git").exists():
@@ -1031,8 +1059,24 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         delivery = DeliveryConfig(mr_mode="instructions", remote=remote, target_branch=target_branch)
 
     # Create base directories deterministically.
+    orch_dir.mkdir(parents=True, exist_ok=False)
     runs_dir.mkdir(parents=True, exist_ok=True)
     packets_dir.mkdir(parents=True, exist_ok=True)
+    (orch_root / "CURRENT_TASK").write_text(task_id + "\n", encoding="utf-8")
+    (orch_dir / "TASK.json").write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "goal": goal,
+                "task_kind": task_kind,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     # Provider instance for wizarding/refinement.
     provider: Provider
@@ -1197,6 +1241,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     pipeline = PipelineConfig(
         version=1,
         provider=pipeline_provider_cfg,
+        wizard_provider=wizard_provider_cfg,
         actors=tuple(actor_cfgs),
         orchestration=orchestration,
         goal=goal,
@@ -1209,6 +1254,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     print("")
     print("Setup complete.")
     print(f"Workspace: {workspace_dir}")
+    print(f"Task:      {task_id}")
     print(f"Pipeline:  {pipeline_path}")
 
     return SetupResult(

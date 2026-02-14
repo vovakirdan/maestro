@@ -11,39 +11,51 @@ Commands:
 
     python3 main.py setup --workspace /path/to/workspace
     python3 main.py run --workspace /path/to/workspace
+    python3 main.py run --workspace /path/to/workspace --task <task_id>
 
 Workspace layout created by `setup`:
 
     <workspace>/
       orchestrator/
-        pipeline.json
-        BRIEF.md                 # only when AI setup wizard runs
-        setup_artifacts/         # provider artifacts from setup wizard runs
-        packets/
-          <actor_id>/
-            ROLE.md
-            TARGET.md
-            RULES.md
-            CONTEXT.md
-            REPORT_FORMAT.md
-            INPUTS.md
-            NOTES.md             # append-only; managed by orchestrator during runs
-        runs/
-          <run_id>/
-            state.json
-            timeline.jsonl
-            final.txt
-            final_report.json
-            plan/                # auto/user plan artifacts (if enabled)
-            packets/             # run-local packet copies (inputs are modified here)
-            steps/               # per-step artifacts (attempts, validation, commits)
-              <nn_actor_id>/
+        CURRENT_TASK             # task id used by default in `run`
+        tasks/
+          <task_id>/
+            TASK.json            # task metadata (goal, kind, timestamps)
+            pipeline.json
+            BRIEF.md             # only when AI setup wizard runs
+            setup_artifacts/     # provider artifacts from setup wizard runs
+            packets/
+              <actor_id>/
+                ROLE.md
+                TARGET.md
+                RULES.md
+                CONTEXT.md
+                REPORT_FORMAT.md
+                INPUTS.md
+                NOTES.md         # append-only; managed by orchestrator during runs
+            runs/
+              <run_id>/
+                state.json
+                timeline.jsonl
                 final.txt
-                report.json
-                commit.json      # only if auto-commit created a commit
-                attempt_1/
-                attempt_2/
-            delivery/            # MR instructions (if enabled)
+                final_report.json
+                NEEDS_INPUT.md   # only when run stops with NEEDS_INPUT
+                plan/            # auto/user plan artifacts (if enabled)
+                escalation/      # escalation wizard output (if enabled/available)
+                packets/         # run-local packet copies (inputs are modified here)
+                steps/           # per-step artifacts (attempts, validation, commits)
+                  <nn_actor_id>/
+                    final.txt
+                    report.json
+                    commit.json  # only if auto-commit created a commit
+                    attempt_1/
+                    attempt_2/
+                delivery/        # MR instructions (if enabled)
+
+Legacy layout is still supported:
+- <workspace>/orchestrator/pipeline.json
+- <workspace>/orchestrator/packets/
+- <workspace>/orchestrator/runs/
 
 Setup flow:
 - Task type (feature/bug/bootstrap/other).
@@ -60,6 +72,7 @@ Setup flow:
   - Packet docs are written for isolated agents (no orchestration/other-agent mentions).
   - Setup artifacts are saved under `orchestrator/setup_artifacts/` for debugging.
 - If task type is `bootstrap` and the workspace is not a git repo, setup can optionally run `git init`.
+- Each `setup` creates a new task folder under `orchestrator/tasks/<task_id>/` and updates `orchestrator/CURRENT_TASK`.
 
 Workflow presets:
 - `crt`: coder -> reviewer -> tester. If reviewer/tester returns `FAILED`, the run routes back to coder.
@@ -89,6 +102,10 @@ Run flow:
     "attempt 2" means a report-format retry for the same step.
   - Writes upstream handoff into the next step's `INPUTS.md` (in the run-local packet copy).
   - If `git safety=branch` and auto-commit is enabled, commits workspace changes (excluding `orchestrator/`).
+- If the run stops with `NEEDS_INPUT`:
+  - The run writes `NEEDS_INPUT.md` for the user.
+  - If a non-deterministic provider is available, an escalation wizard writes `runs/<run_id>/escalation/escalation.md`
+    with suggested resolutions and subtasks.
 
 Progress output:
 - When stderr is a TTY, `run` shows a single-line spinner status on stderr.

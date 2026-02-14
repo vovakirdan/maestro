@@ -263,6 +263,7 @@ def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
     raw = {
         "version": 1,
         "provider": {"type": "deterministic", "timeout_s": 1.0, "idle_timeout_s": 1.0},
+        "wizard_provider": {"type": "deterministic", "timeout_s": 2.0, "idle_timeout_s": 3.0},
         "actors": [
             {"actor_id": "coder", "packet_dir": "coder", "include_paths_in_prompt": True},
             {"actor_id": "reviewer", "packet_dir": "reviewer", "include_paths_in_prompt": True},
@@ -312,6 +313,16 @@ def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
                 message=f"Expected review_policies to parse, got: {orch.review_policies!r}",
             )
         ]
+    wiz = pipeline.wizard_provider
+    if wiz is None or wiz.type != "deterministic" or wiz.timeout_s != 2.0 or wiz.idle_timeout_s != 3.0:
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="PIPE004",
+                message=f"Expected wizard_provider to parse, got: {wiz!r}",
+            )
+        ]
     return []
 
 
@@ -330,6 +341,7 @@ def _check_pipeline_task_parsing(root: Path) -> list[Issue]:
         "goal": "G",
         "task": {"kind": "bug", "details_md": "repro"},
         "provider": {"type": "deterministic", "timeout_s": 1.0, "idle_timeout_s": 1.0},
+        "wizard_provider": {"type": "deterministic", "timeout_s": 2.0, "idle_timeout_s": 3.0},
         "actors": [
             {"actor_id": "coder", "packet_dir": "coder", "include_paths_in_prompt": True},
             {"actor_id": "reviewer", "packet_dir": "reviewer", "include_paths_in_prompt": True},
@@ -363,6 +375,16 @@ def _check_pipeline_task_parsing(root: Path) -> list[Issue]:
                 line=None,
                 code="TASK003",
                 message=f"Unexpected task parsed: {pipeline.task!r}",
+            )
+        ]
+    wiz = pipeline.wizard_provider
+    if wiz is None or wiz.type != "deterministic" or wiz.timeout_s != 2.0 or wiz.idle_timeout_s != 3.0:
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="TASK004",
+                message=f"Expected wizard_provider to parse, got: {wiz!r}",
             )
         ]
     return []

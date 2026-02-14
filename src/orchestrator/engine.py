@@ -23,6 +23,7 @@ from src.core.runtime import (
 )
 from src.core.types import JsonDict, Status, StructuredReport
 from src.orchestrator.validator import ReportValidator, retry_instructions
+from src.orchestrator.wizard import run_escalation_wizard
 from src.providers.base import Provider
 from src.providers.claude_cli import ClaudeCLIProvider
 from src.providers.codex_cli import CodexCLIProvider
@@ -207,15 +208,65 @@ class GitPolicy:
 
 @dataclass
 class OrchestratorEngine:
+    workspace_dir: Path
     orchestrator_dir: Path
     pipeline: PipelineConfig
+    task_id: str | None = None
 
     @staticmethod
-    def load(*, workspace_dir: Path) -> OrchestratorEngine:
-        orch_dir = orchestrator_root(workspace_dir.resolve())
-        pipeline_path = orch_dir / "pipeline.json"
-        pipeline = load_pipeline(pipeline_path)
-        return OrchestratorEngine(orchestrator_dir=orch_dir, pipeline=pipeline)
+    def load(*, workspace_dir: Path, task_id: str | None = None) -> OrchestratorEngine:
+        workspace_dir = workspace_dir.resolve()
+        orch_root = orchestrator_root(workspace_dir)
+        tasks_root = orch_root / "tasks"
+
+        def load_task_dir(tid: str) -> OrchestratorEngine:
+            tdir = tasks_root / tid
+            pipeline_path = tdir / "pipeline.json"
+            if not pipeline_path.exists():
+                raise ValueError(f"Task not found or missing pipeline.json: {tdir}")
+            pipeline = load_pipeline(pipeline_path)
+            return OrchestratorEngine(
+                workspace_dir=workspace_dir,
+                orchestrator_dir=tdir,
+                pipeline=pipeline,
+                task_id=tid,
+            )
+
+        if task_id is not None and task_id.strip():
+            return load_task_dir(task_id.strip())
+
+        current_path = orch_root / "CURRENT_TASK"
+        if current_path.exists():
+            tid = current_path.read_text(encoding="utf-8").strip()
+            if tid:
+                return load_task_dir(tid)
+
+        if tasks_root.exists():
+            task_dirs = sorted([p for p in tasks_root.iterdir() if p.is_dir()])
+            candidates: list[str] = []
+            for p in task_dirs:
+                if (p / "pipeline.json").exists():
+                    candidates.append(p.name)
+            if len(candidates) == 1:
+                return load_task_dir(candidates[0])
+
+        # Legacy layout: <workspace>/orchestrator/pipeline.json
+        legacy_pipeline_path = orch_root / "pipeline.json"
+        if legacy_pipeline_path.exists():
+            pipeline = load_pipeline(legacy_pipeline_path)
+            return OrchestratorEngine(
+                workspace_dir=workspace_dir,
+                orchestrator_dir=orch_root,
+                pipeline=pipeline,
+                task_id=None,
+            )
+
+        raise ValueError(
+            "No pipeline found. Expected one of:\n"
+            "- <workspace>/orchestrator/pipeline.json (legacy)\n"
+            "- <workspace>/orchestrator/CURRENT_TASK pointing to tasks/<task_id>/pipeline.json\n"
+            "- <workspace>/orchestrator/tasks/<task_id>/pipeline.json (use --task)\n"
+        )
 
     def _make_provider_from_cfg(self, cfg: ActorConfig | ProviderConfig) -> Provider:
         """
@@ -232,13 +283,13 @@ class OrchestratorEngine:
             return DeterministicProvider()
         if cfg.type == "codex_cli":
             assert cfg.command is not None
-            return CodexCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
+            return CodexCLIProvider(command=cfg.command, cwd=self.workspace_dir)
         if cfg.type == "gemini_cli":
             assert cfg.command is not None
-            return GeminiCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
+            return GeminiCLIProvider(command=cfg.command, cwd=self.workspace_dir)
         if cfg.type == "claude_cli":
             assert cfg.command is not None
-            return ClaudeCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
+            return ClaudeCLIProvider(command=cfg.command, cwd=self.workspace_dir)
         raise ValueError(f"Unsupported provider type: {cfg.type!r}")
 
     def run(
@@ -298,7 +349,7 @@ class OrchestratorEngine:
         _write_json(state_path, state)
         timeline.append({"type": "run_started", "run_id": run_id})
 
-        workspace_root = self.orchestrator_dir.parent
+        workspace_root = self.workspace_dir
 
         def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -588,8 +639,12 @@ class OrchestratorEngine:
             return timeout_s, idle_timeout_s
 
         def _plan_provider_cfg() -> ProviderConfig:
-            # Prefer the first non-deterministic provider in the pipeline, so auto-plan works
-            # even when the pipeline default is deterministic but an actor override is not.
+            # Prefer wizard_provider when available, otherwise pick the first non-deterministic
+            # provider in the pipeline so auto-plan works even when the pipeline default is
+            # deterministic but an actor override is not.
+            wiz = self.pipeline.wizard_provider
+            if wiz is not None and wiz.type != "deterministic":
+                return wiz
             for a in self.pipeline.actors:
                 cfg = _provider_cfg_for_actor(a)
                 if cfg.type != "deterministic":
@@ -642,7 +697,7 @@ class OrchestratorEngine:
                         "- Keep it language-agnostic.\n",
                         "- Be practical and actionable.\n",
                         "- Use plain markdown (no code fences).\n\n",
-                        f"Workspace root: {self.orchestrator_dir.parent.as_posix()}\n\n",
+                        f"Workspace root: {self.workspace_dir.as_posix()}\n\n",
                         f"Task type: {task_kind}\n",
                         "Task type notes:\n",
                         "- feature: avoid regressions; preserve existing behavior.\n",
@@ -909,6 +964,33 @@ class OrchestratorEngine:
         final_report: StructuredReport | None = None
         final_text: str = ""
         overall_status = Status.OK
+        stop_reason: str | None = None
+        stop_step: str | None = None
+        stop_actor_id: str | None = None
+        stop_report: StructuredReport | None = None
+        stop_returns_used: int | None = None
+        stop_max_returns: int | None = None
+        stop_last_commit: str | None = None
+
+        def mark_stop(
+            *,
+            reason: str,
+            step: str,
+            actor_id: str,
+            report: StructuredReport | None,
+            returns_used: int | None = None,
+            max_returns: int | None = None,
+            last_commit: str | None = None,
+        ) -> None:
+            nonlocal stop_reason, stop_step, stop_actor_id, stop_report
+            nonlocal stop_returns_used, stop_max_returns, stop_last_commit
+            stop_reason = reason
+            stop_step = step
+            stop_actor_id = actor_id
+            stop_report = report
+            stop_returns_used = returns_used
+            stop_max_returns = max_returns
+            stop_last_commit = last_commit
 
         orch = self.pipeline.orchestration
         if orch is None:
@@ -952,6 +1034,13 @@ class OrchestratorEngine:
                     continue
 
                 overall_status = report.status
+                if overall_status == Status.NEEDS_INPUT:
+                    mark_stop(
+                        reason="agent_needs_input",
+                        step=step_name,
+                        actor_id=actor_id,
+                        report=report,
+                    )
                 state["status"] = overall_status.value
                 state["finished_at_utc"] = _now_iso_utc()
                 _write_json(state_path, state)
@@ -1076,6 +1165,15 @@ class OrchestratorEngine:
                             )
                             + "\n"
                         )
+                        mark_stop(
+                            reason="review_policy_escalation",
+                            step=step_name,
+                            actor_id=actor_id,
+                            report=final_report,
+                            returns_used=returns_used,
+                            max_returns=max_returns,
+                            last_commit=last_commit,
+                        )
                         state["status"] = overall_status.value
                         state["finished_at_utc"] = _now_iso_utc()
                         _write_json(state_path, state)
@@ -1125,6 +1223,15 @@ class OrchestratorEngine:
                                 )
                                 + "\n"
                             )
+                            mark_stop(
+                                reason="review_policy_return_not_possible",
+                                step=step_name,
+                                actor_id=actor_id,
+                                report=final_report,
+                                returns_used=returns_used,
+                                max_returns=max_returns,
+                                last_commit=last_commit,
+                            )
                             state["status"] = overall_status.value
                             state["finished_at_utc"] = _now_iso_utc()
                             _write_json(state_path, state)
@@ -1166,6 +1273,15 @@ class OrchestratorEngine:
                                     sort_keys=True,
                                 )
                                 + "\n"
+                            )
+                            mark_stop(
+                                reason="max_returns_exceeded",
+                                step=step_name,
+                                actor_id=actor_id,
+                                report=final_report,
+                                returns_used=returns_used,
+                                max_returns=max_returns,
+                                last_commit=last_commit,
                             )
                             state["status"] = overall_status.value
                             state["finished_at_utc"] = _now_iso_utc()
@@ -1273,6 +1389,15 @@ class OrchestratorEngine:
 
                 if report.status == Status.NEEDS_INPUT:
                     overall_status = Status.NEEDS_INPUT
+                    mark_stop(
+                        reason="agent_needs_input",
+                        step=step_name,
+                        actor_id=actor_id,
+                        report=report,
+                        returns_used=returns_used,
+                        max_returns=max_returns,
+                        last_commit=last_commit,
+                    )
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
                     _write_json(state_path, state)
@@ -1336,6 +1461,15 @@ class OrchestratorEngine:
                         )
                         + "\n"
                     )
+                    mark_stop(
+                        reason="max_returns_exceeded",
+                        step=step_name,
+                        actor_id=actor_id,
+                        report=final_report,
+                        returns_used=returns_used,
+                        max_returns=max_returns,
+                        last_commit=last_commit,
+                    )
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
                     _write_json(state_path, state)
@@ -1395,6 +1529,182 @@ class OrchestratorEngine:
                     "artifacts": list(final_report.artifacts),
                 },
             )
+
+        if overall_status == Status.NEEDS_INPUT and final_report is not None:
+            # Convenience artifact for humans / tooling to resume with additional inputs.
+            ni_path = run_dir / "NEEDS_INPUT.md"
+            ni_parts: list[str] = []
+            ni_parts.append("# NEEDS_INPUT")
+            ni_parts.append("")
+            ni_parts.append(f"run_id: {run_id}")
+            if stop_step:
+                ni_parts.append(f"step: {stop_step}")
+            if stop_actor_id:
+                ni_parts.append(f"actor_id: {stop_actor_id}")
+            if stop_reason:
+                ni_parts.append(f"reason: {stop_reason}")
+            ni_parts.append("")
+            if final_report.next_inputs.strip():
+                ni_parts.append(final_report.next_inputs.rstrip())
+            else:
+                ni_parts.append("(no next_inputs provided)")
+            ni_parts.append("")
+            ni_parts.append("To continue:")
+            ni_parts.append(
+                "- Update the task packets under this task's packets/ directory (or re-run setup), then run again."
+            )
+            ni_path.write_text("\n".join(ni_parts).rstrip() + "\n", encoding="utf-8")
+
+        # Optional: run an escalation wizard before stopping, to propose resolutions/subtasks.
+        if (
+            overall_status == Status.NEEDS_INPUT
+            and stop_step is not None
+            and stop_actor_id is not None
+            and stop_report is not None
+        ):
+            packet_dir_by_actor = {a.actor_id: a.packet_dir for a in self.pipeline.actors}
+            inputs_md = ""
+            packet_dir_name = packet_dir_by_actor.get(stop_actor_id)
+            if packet_dir_name is not None:
+                try:
+                    inputs_md = (run_packets_dir / packet_dir_name / "INPUTS.md").read_text(
+                        encoding="utf-8"
+                    )
+                except Exception:
+                    inputs_md = ""
+
+            def escalation_provider_cfg() -> ProviderConfig | None:
+                wiz = self.pipeline.wizard_provider
+                if wiz is not None and wiz.type != "deterministic":
+                    return wiz
+                for a in self.pipeline.actors:
+                    cfg = _provider_cfg_for_actor(a)
+                    if cfg.type != "deterministic":
+                        return cfg
+                if self.pipeline.provider.type != "deterministic":
+                    return self.pipeline.provider
+                return None
+
+            esc_cfg = escalation_provider_cfg()
+            if esc_cfg is None:
+                timeline.append(
+                    {
+                        "type": "escalation_wizard_skipped",
+                        "run_id": run_id,
+                        "reason": "no_non_deterministic_provider",
+                        "step": stop_step,
+                        "actor_id": stop_actor_id,
+                    }
+                )
+                log("escalation: skipped (no non-deterministic provider configured).")
+            else:
+                esc_provider = self._make_provider_from_cfg(esc_cfg)
+                esc_timeout_s, esc_idle_timeout_s = _effective_timeouts(esc_cfg)
+                esc_attempt_dir = run_dir / "escalation" / "attempt_1"
+                esc_attempt_dir.mkdir(parents=True, exist_ok=True)
+
+                timeline.append(
+                    {
+                        "type": "escalation_wizard_started",
+                        "run_id": run_id,
+                        "step": stop_step,
+                        "actor_id": stop_actor_id,
+                        "reason": stop_reason or "needs_input",
+                        "provider_type": esc_cfg.type,
+                    }
+                )
+
+                def esc_event_cb(ev: JsonDict) -> None:
+                    if on_event is None:
+                        return
+                    try:
+                        on_event(
+                            {
+                                "type": "provider_event",
+                                "run_id": run_id,
+                                "step": "zz_escalation",
+                                "actor_id": "wizard",
+                                "attempt": 1,
+                                "event": ev,
+                            }
+                        )
+                    except Exception:
+                        pass
+
+                ok = False
+                out_path = run_dir / "escalation" / "escalation.md"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    res, meta = run_escalation_wizard(
+                        esc_provider,
+                        workspace_dir=self.workspace_dir,
+                        goal=(self.pipeline.goal or "").strip(),
+                        task=self.pipeline.task,
+                        run_id=run_id,
+                        step=stop_step,
+                        actor_id=stop_actor_id,
+                        reason=stop_reason or "needs_input",
+                        report=stop_report,
+                        inputs_md=inputs_md,
+                        last_commit=stop_last_commit,
+                        returns_used=stop_returns_used,
+                        max_returns=stop_max_returns,
+                        artifacts_dir=esc_attempt_dir,
+                        timeout_s=esc_timeout_s,
+                        idle_timeout_s=esc_idle_timeout_s,
+                        on_event=esc_event_cb,
+                    )
+                    ok = res is not None and bool(res.escalation_md.strip())
+                    if res is None or not res.escalation_md.strip():
+                        fallback = []
+                        fallback.append("# Escalation")
+                        fallback.append("")
+                        fallback.append("The run stopped with NEEDS_INPUT, but the escalation wizard returned no result.")
+                        fallback.append("")
+                        fallback.append(f"reason: {stop_reason or 'needs_input'}")
+                        fallback.append(f"step: {stop_step}")
+                        fallback.append(f"actor_id: {stop_actor_id}")
+                        fallback.append("")
+                        fallback.append("Agent next_inputs:")
+                        fallback.append("")
+                        fallback.append((stop_report.next_inputs or "").rstrip() or "(empty)")
+                        fallback.append("")
+                        out_path.write_text("\n".join(fallback).rstrip() + "\n", encoding="utf-8")
+                    else:
+                        out_path.write_text(res.escalation_md.rstrip() + "\n", encoding="utf-8")
+
+                    _write_json(
+                        run_dir / "escalation" / "metadata.json",
+                        {
+                            "ok": ok,
+                            "provider_type": esc_cfg.type,
+                            "provider_metadata": meta,
+                            "reason": stop_reason or "needs_input",
+                            "step": stop_step,
+                            "actor_id": stop_actor_id,
+                        },
+                    )
+                    timeline.append(
+                        {
+                            "type": "escalation_wizard_finished",
+                            "run_id": run_id,
+                            "ok": ok,
+                            "path": out_path.as_posix(),
+                            "provider_metadata": meta,
+                        }
+                    )
+                    state["escalation"] = {"present": True, "path": out_path.as_posix()}
+                    _write_json(state_path, state)
+                    log(f"escalation: wrote {out_path}")
+                except Exception as e:
+                    timeline.append(
+                        {
+                            "type": "escalation_wizard_failed",
+                            "run_id": run_id,
+                            "error": str(e),
+                        }
+                    )
+                    log(f"WARN: escalation wizard failed ({e})")
 
         # Optional: emit merge request instructions at the end of the run.
         delivery = self.pipeline.delivery
