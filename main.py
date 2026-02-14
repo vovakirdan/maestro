@@ -291,7 +291,10 @@ def main(argv: list[str] | None = None) -> int:
 
             plan_req: PlanRequest | None = None
             if sys.stdin.isatty():
-                allow_auto = engine.pipeline.provider.type != "deterministic"
+                allow_auto = any(
+                    (a.provider or engine.pipeline.provider).type != "deterministic"
+                    for a in engine.pipeline.actors
+                )
                 plan_choices = ["none", "user"]
                 if allow_auto:
                     plan_choices = ["auto", "user", "none"]

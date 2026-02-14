@@ -12,7 +12,14 @@ from typing import Literal
 
 from src.core.actor import Actor
 from src.core.packet import Packet
-from src.core.runtime import ActorConfig, PipelineConfig, generate_run_id, load_pipeline, orchestrator_root
+from src.core.runtime import (
+    ActorConfig,
+    PipelineConfig,
+    ProviderConfig,
+    generate_run_id,
+    load_pipeline,
+    orchestrator_root,
+)
 from src.core.types import JsonDict, Status, StructuredReport
 from src.orchestrator.validator import ReportValidator, retry_instructions
 from src.providers.base import Provider
@@ -121,8 +128,17 @@ class OrchestratorEngine:
         pipeline = load_pipeline(pipeline_path)
         return OrchestratorEngine(orchestrator_dir=orch_dir, pipeline=pipeline)
 
-    def _make_provider(self) -> Provider:
-        cfg = self.pipeline.provider
+    def _make_provider_from_cfg(self, cfg: ActorConfig | ProviderConfig) -> Provider:
+        """
+        Construct a provider instance from either a ProviderConfig or an ActorConfig
+        (ActorConfig may carry a provider override).
+        """
+        if isinstance(cfg, ActorConfig):
+            provider_cfg = cfg.provider or self.pipeline.provider
+        else:
+            provider_cfg = cfg
+
+        cfg = provider_cfg
         if cfg.type == "deterministic":
             return DeterministicProvider()
         if cfg.type == "codex_cli":
@@ -150,23 +166,18 @@ class OrchestratorEngine:
             if progress:
                 progress(msg)
 
-        provider = self._make_provider()
         validator = ReportValidator()
 
-        timeout_s = (
-            float(timeout_s_override)
-            if timeout_s_override is not None
-            else self.pipeline.provider.timeout_s
+        timeout_override = (
+            float(timeout_s_override) if timeout_s_override is not None else None
         )
-        idle_timeout_s = (
-            float(idle_timeout_s_override)
-            if idle_timeout_s_override is not None
-            else self.pipeline.provider.idle_timeout_s
+        idle_timeout_override = (
+            float(idle_timeout_s_override) if idle_timeout_s_override is not None else None
         )
-        if timeout_s < 0:
-            raise ValueError(f"timeout_s must be >= 0, got: {timeout_s}")
-        if idle_timeout_s < 0:
-            raise ValueError(f"idle_timeout_s must be >= 0, got: {idle_timeout_s}")
+        if timeout_override is not None and timeout_override < 0:
+            raise ValueError(f"timeout_s must be >= 0, got: {timeout_override}")
+        if idle_timeout_override is not None and idle_timeout_override < 0:
+            raise ValueError(f"idle_timeout_s must be >= 0, got: {idle_timeout_override}")
 
         run_id = generate_run_id()
         run_dir = self.orchestrator_dir / "runs" / run_id
@@ -186,7 +197,14 @@ class OrchestratorEngine:
             "started_at_utc": _now_iso_utc(),
             "status": "RUNNING",
             "steps": [],
-            "provider_timeouts": {"timeout_s": timeout_s, "idle_timeout_s": idle_timeout_s},
+            "provider_timeouts": {
+                "timeout_s_override": timeout_override,
+                "idle_timeout_s_override": idle_timeout_override,
+                "pipeline_default": {
+                    "timeout_s": self.pipeline.provider.timeout_s,
+                    "idle_timeout_s": self.pipeline.provider.idle_timeout_s,
+                },
+            },
         }
         _write_json(state_path, state)
         timeline.append({"type": "run_started", "run_id": run_id})
@@ -464,6 +482,31 @@ class OrchestratorEngine:
             log(f"git: committed {commit[:12]} for {step_name} ({actor_id})")
             return commit
 
+        def _provider_cfg_for_actor(actor_cfg: ActorConfig) -> ProviderConfig:
+            return actor_cfg.provider or self.pipeline.provider
+
+        def _effective_timeouts(cfg: ProviderConfig) -> tuple[float, float]:
+            timeout_s = timeout_override if timeout_override is not None else cfg.timeout_s
+            idle_timeout_s = (
+                idle_timeout_override if idle_timeout_override is not None else cfg.idle_timeout_s
+            )
+            timeout_s = float(timeout_s)
+            idle_timeout_s = float(idle_timeout_s)
+            if timeout_s < 0:
+                raise ValueError(f"timeout_s must be >= 0, got: {timeout_s}")
+            if idle_timeout_s < 0:
+                raise ValueError(f"idle_timeout_s must be >= 0, got: {idle_timeout_s}")
+            return timeout_s, idle_timeout_s
+
+        def _plan_provider_cfg() -> ProviderConfig:
+            # Prefer the first non-deterministic provider in the pipeline, so auto-plan works
+            # even when the pipeline default is deterministic but an actor override is not.
+            for a in self.pipeline.actors:
+                cfg = _provider_cfg_for_actor(a)
+                if cfg.type != "deterministic":
+                    return cfg
+            return self.pipeline.provider
+
         plan_mode: PlanMode = "none"
         plan_text: str = ""
         if plan is not None:
@@ -481,8 +524,11 @@ class OrchestratorEngine:
 
         # Optional: generate a plan via provider before running steps.
         if plan is not None and plan.mode == "auto":
-            if self.pipeline.provider.type == "deterministic":
-                log("WARN: plan mode 'auto' requested, but provider is deterministic; skipping plan.")
+            plan_cfg = _plan_provider_cfg()
+            if plan_cfg.type == "deterministic":
+                log(
+                    "WARN: plan mode 'auto' requested, but no non-deterministic provider is configured; skipping plan."
+                )
                 timeline.append(
                     {
                         "type": "plan_skipped",
@@ -491,6 +537,8 @@ class OrchestratorEngine:
                     }
                 )
             else:
+                provider = self._make_provider_from_cfg(plan_cfg)
+                plan_timeout_s, plan_idle_timeout_s = _effective_timeouts(plan_cfg)
                 goal = (self.pipeline.goal or "").strip()
                 task_kind = "feature"
                 task_details = ""
@@ -545,8 +593,8 @@ class OrchestratorEngine:
                     res = provider.run(
                         plan_prompt,
                         artifacts_dir=plan_dir,
-                        timeout_s=timeout_s,
-                        idle_timeout_s=idle_timeout_s,
+                        timeout_s=plan_timeout_s,
+                        idle_timeout_s=plan_idle_timeout_s,
                         on_event=plan_event_cb,
                     )
                     plan_text = res.final_text.strip()
@@ -602,9 +650,19 @@ class OrchestratorEngine:
             step_dir = steps_dir / step_name
             step_dir.mkdir(parents=True, exist_ok=False)
 
+            provider_cfg = _provider_cfg_for_actor(actor_cfg)
+            provider = self._make_provider_from_cfg(provider_cfg)
+            step_timeout_s, step_idle_timeout_s = _effective_timeouts(provider_cfg)
+
             log(f"[{invocation_i}] {actor_id}: step started")
             timeline.append(
-                {"type": "step_started", "run_id": run_id, "step": step_name, "actor_id": actor_id}
+                {
+                    "type": "step_started",
+                    "run_id": run_id,
+                    "step": step_name,
+                    "actor_id": actor_id,
+                    "provider_type": provider_cfg.type,
+                }
             )
 
             packet_dir = run_packets_dir / actor_cfg.packet_dir
@@ -654,8 +712,8 @@ class OrchestratorEngine:
 
                 res = actor.run(
                     artifacts_dir=attempt_dir,
-                    timeout_s=timeout_s,
-                    idle_timeout_s=idle_timeout_s,
+                    timeout_s=step_timeout_s,
+                    idle_timeout_s=step_idle_timeout_s,
                     extra_instructions=extra,
                     on_event=provider_event_cb,
                 )

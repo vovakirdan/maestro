@@ -76,13 +76,17 @@ class ActorConfig:
     actor_id: str
     packet_dir: str
     include_paths_in_prompt: bool = True
+    provider: ProviderConfig | None = None
 
     def to_dict(self) -> JsonDict:
-        return {
+        d: JsonDict = {
             "actor_id": self.actor_id,
             "packet_dir": self.packet_dir,
             "include_paths_in_prompt": self.include_paths_in_prompt,
         }
+        if self.provider is not None:
+            d["provider"] = self.provider.to_dict()
+        return d
 
     @staticmethod
     def from_dict(obj: dict[str, Any]) -> ActorConfig:
@@ -95,10 +99,18 @@ class ActorConfig:
         include_paths = obj.get("include_paths_in_prompt", True)
         if not isinstance(include_paths, bool):
             raise ValueError("actor.include_paths_in_prompt must be boolean")
+
+        provider_raw = obj.get("provider")
+        provider: ProviderConfig | None = None
+        if provider_raw is not None:
+            if not isinstance(provider_raw, dict):
+                raise ValueError("actor.provider must be an object")
+            provider = ProviderConfig.from_dict(provider_raw)
         return ActorConfig(
             actor_id=actor_id.strip(),
             packet_dir=packet_dir.strip(),
             include_paths_in_prompt=include_paths,
+            provider=provider,
         )
 
 

@@ -2,9 +2,9 @@ Minimal multi-agent orchestration system (Python standard library only).
 
 This repo provides:
 - Packet-based, provider-agnostic actors (ROLE/TARGET/RULES/CONTEXT/REPORT_FORMAT/INPUTS/NOTES).
-- Pluggable providers: `deterministic` (offline) and `codex_cli` (Codex CLI JSONL).
+- Pluggable providers: `deterministic` (offline), `codex_cli`, `gemini_cli`, `claude_cli`.
 - A sequential orchestrator with an optional linear "return-on-failure" loop.
-- An interactive `setup` wizard (human prompts) plus an optional AI setup-wizard stage (Codex only).
+- An interactive `setup` wizard (human prompts) plus an optional AI setup-wizard stage.
 - Optional plan injection, git safety, auto-commit, and merge request instructions.
 
 Commands:
@@ -49,9 +49,11 @@ Setup flow:
 - Task type (feature/bug/bootstrap/other).
 - Workflow preset (crt/cr/c/r/t/d/custom).
 - Provider selection:
-  - `deterministic`: offline, no AI generation.
-  - `codex_cli`: requires a local Codex CLI command that emits JSONL on stdout (use `--json`).
-- Optional: "setup wizard (AI)" (Codex only):
+  - The CLI only offers providers that are installed (found on PATH).
+  - You can use one provider for everything (wizard + all agents), or split it:
+    - choose a wizard provider
+    - choose one provider for all agents, or per-agent providers (overrides)
+- Optional: "setup wizard (AI)" (any non-deterministic provider):
   - `wizard:analyze` writes `orchestrator/BRIEF.md` (high-signal decomposition).
   - `wizard:packet:<actor_id>` rewrites packet docs to be detailed and executable.
   - Packet docs are written for isolated agents (no orchestration/other-agent mentions).
@@ -72,7 +74,7 @@ Workflow presets:
 
 Run flow:
 - Plan mode (auto/user/none):
-  - `auto`: generate a plan via provider and inject it into INPUTS.md for all steps (skipped for deterministic).
+  - `auto`: generate a plan via the first non-deterministic provider in the pipeline and inject it into INPUTS.md.
   - `user`: use a user plan (paste or file path).
   - `none`: no plan injection.
 - Git safety (branch/check/off), if the workspace is a git repo root:

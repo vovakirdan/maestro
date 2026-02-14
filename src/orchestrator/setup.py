@@ -769,71 +769,122 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     interaction_notes = _prompt_multiline_optional("Workflow/interaction notes")
 
     # Provider selection (only offer installed CLIs).
-    choices: list[str] = ["deterministic"]
+    available: list[str] = ["deterministic"]
     if shutil.which("codex") is not None:
-        choices.append("codex_cli")
+        available.append("codex_cli")
     if shutil.which("gemini") is not None:
-        choices.append("gemini_cli")
+        available.append("gemini_cli")
     if shutil.which("claude") is not None:
-        choices.append("claude_cli")
+        available.append("claude_cli")
 
-    provider_type = _prompt_choice(
-        f"Provider ({'/'.join(choices)})",
-        choices=choices,
-        default="deterministic",
-    )
+    def _preferred_ai_provider() -> str:
+        for t in ("codex_cli", "gemini_cli", "claude_cli"):
+            if t in available:
+                return t
+        return "deterministic"
 
-    provider_cfg: ProviderConfig
-    if provider_type == "codex_cli":
-        cmd_raw = _prompt_line(
-            "Codex command (shell syntax)",
-            default="codex exec --json --full-auto",
+    def _prompt_provider_cfg(*, label: str, default_type: str) -> ProviderConfig:
+        provider_type = _prompt_choice(
+            f"{label} ({'/'.join(available)})",
+            choices=available,
+            default=default_type if default_type in available else "deterministic",
         )
-        command = tuple(shlex.split(cmd_raw))
-        if "--json" not in command:
-            print("WARN: Codex command does not include '--json'; JSONL parsing may fail.")
-        provider_cfg = ProviderConfig(type="codex_cli", command=command, timeout_s=0.0, idle_timeout_s=600.0)
-    elif provider_type == "gemini_cli":
-        cmd_raw = _prompt_line(
-            "Gemini command (shell syntax)",
-            default='gemini --output-format text --approval-mode yolo -p " "',
-        )
-        command = tuple(shlex.split(cmd_raw))
-        provider_cfg = ProviderConfig(
-            type="gemini_cli",
-            command=command,
-            timeout_s=0.0,
-            idle_timeout_s=600.0,
-        )
-    elif provider_type == "claude_cli":
-        cmd_raw = _prompt_line(
-            "Claude command (shell syntax)",
-            default="claude -p --output-format text --input-format text --permission-mode acceptEdits",
-        )
-        command = tuple(shlex.split(cmd_raw))
-        provider_cfg = ProviderConfig(
-            type="claude_cli",
-            command=command,
-            timeout_s=0.0,
-            idle_timeout_s=600.0,
-        )
+
+        if provider_type == "codex_cli":
+            cmd_raw = _prompt_line(
+                "Codex command (shell syntax)",
+                default="codex exec --json --full-auto",
+            )
+            command = tuple(shlex.split(cmd_raw))
+            if "--json" not in command:
+                print("WARN: Codex command does not include '--json'; JSONL parsing may fail.")
+            return ProviderConfig(
+                type="codex_cli",
+                command=command,
+                timeout_s=0.0,
+                idle_timeout_s=600.0,
+            )
+
+        if provider_type == "gemini_cli":
+            cmd_raw = _prompt_line(
+                "Gemini command (shell syntax)",
+                default='gemini --output-format text --approval-mode yolo -p \" \"',
+            )
+            command = tuple(shlex.split(cmd_raw))
+            return ProviderConfig(
+                type="gemini_cli",
+                command=command,
+                timeout_s=0.0,
+                idle_timeout_s=600.0,
+            )
+
+        if provider_type == "claude_cli":
+            cmd_raw = _prompt_line(
+                "Claude command (shell syntax)",
+                default="claude -p --output-format text --input-format text --permission-mode acceptEdits",
+            )
+            command = tuple(shlex.split(cmd_raw))
+            return ProviderConfig(
+                type="claude_cli",
+                command=command,
+                timeout_s=0.0,
+                idle_timeout_s=600.0,
+            )
+
+        return ProviderConfig(type="deterministic")
+
+    one_provider = _prompt_yes_no("Use one provider for wizard + all agents?", default=True)
+    provider_overrides: dict[str, ProviderConfig] = {}
+
+    wizard_provider_cfg: ProviderConfig
+    pipeline_provider_cfg: ProviderConfig
+
+    if one_provider:
+        base_default = _preferred_ai_provider()
+        pipeline_provider_cfg = _prompt_provider_cfg(label="Provider", default_type=base_default)
+        wizard_provider_cfg = pipeline_provider_cfg
     else:
-        provider_cfg = ProviderConfig(type="deterministic")
-
-    timeout_s = float(
-        _prompt_line(
-            "Hard timeout seconds (0=disabled)", default=str(int(provider_cfg.timeout_s))
+        wizard_provider_cfg = _prompt_provider_cfg(
+            label="Wizard provider",
+            default_type=_preferred_ai_provider(),
         )
-    )
+        one_agents = _prompt_yes_no("Use one provider for all agents?", default=True)
+        if one_agents:
+            pipeline_provider_cfg = _prompt_provider_cfg(
+                label="Agent provider",
+                default_type=wizard_provider_cfg.type,
+            )
+        else:
+            last_type = wizard_provider_cfg.type
+            if last_type == "deterministic":
+                last_type = _preferred_ai_provider()
+            for a in agents:
+                cfg = _prompt_provider_cfg(label=f"Provider for {a.actor_id}", default_type=last_type)
+                provider_overrides[a.actor_id] = cfg
+                last_type = cfg.type
+            pipeline_provider_cfg = provider_overrides[agents[0].actor_id]
+
+    selected_cfgs = [wizard_provider_cfg, pipeline_provider_cfg, *provider_overrides.values()]
+    any_cli = any(c.type != "deterministic" for c in selected_cfgs)
+    default_timeout_s = "0" if any_cli else "120"
+    default_idle_timeout_s = "600" if any_cli else "30"
+
+    timeout_s = float(_prompt_line("Hard timeout seconds (0=disabled)", default=default_timeout_s))
     idle_timeout_s = float(
-        _prompt_line("Idle timeout seconds (0=disabled)", default=str(int(provider_cfg.idle_timeout_s)))
+        _prompt_line("Idle timeout seconds (0=disabled)", default=default_idle_timeout_s)
     )
-    provider_cfg = ProviderConfig(
-        type=provider_cfg.type,
-        command=provider_cfg.command,
-        timeout_s=timeout_s,
-        idle_timeout_s=idle_timeout_s,
-    )
+
+    def _with_timeouts(cfg: ProviderConfig) -> ProviderConfig:
+        return ProviderConfig(
+            type=cfg.type,
+            command=cfg.command,
+            timeout_s=timeout_s,
+            idle_timeout_s=idle_timeout_s,
+        )
+
+    wizard_provider_cfg = _with_timeouts(wizard_provider_cfg)
+    pipeline_provider_cfg = _with_timeouts(pipeline_provider_cfg)
+    provider_overrides = {k: _with_timeouts(v) for k, v in provider_overrides.items()}
 
     default_git_mode = "off"
     if (workspace_dir / ".git").exists():
@@ -878,23 +929,23 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
     # Provider instance for wizarding/refinement.
     provider: Provider
-    if provider_cfg.type == "deterministic":
+    if wizard_provider_cfg.type == "deterministic":
         provider = DeterministicProvider()
-    elif provider_cfg.type == "codex_cli":
-        assert provider_cfg.command is not None
-        provider = CodexCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
-    elif provider_cfg.type == "gemini_cli":
-        assert provider_cfg.command is not None
-        provider = GeminiCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
-    elif provider_cfg.type == "claude_cli":
-        assert provider_cfg.command is not None
-        provider = ClaudeCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
+    elif wizard_provider_cfg.type == "codex_cli":
+        assert wizard_provider_cfg.command is not None
+        provider = CodexCLIProvider(command=wizard_provider_cfg.command, cwd=workspace_dir)
+    elif wizard_provider_cfg.type == "gemini_cli":
+        assert wizard_provider_cfg.command is not None
+        provider = GeminiCLIProvider(command=wizard_provider_cfg.command, cwd=workspace_dir)
+    elif wizard_provider_cfg.type == "claude_cli":
+        assert wizard_provider_cfg.command is not None
+        provider = ClaudeCLIProvider(command=wizard_provider_cfg.command, cwd=workspace_dir)
     else:
-        raise ValueError(f"Unsupported provider type: {provider_cfg.type!r}")
+        raise ValueError(f"Unsupported provider type: {wizard_provider_cfg.type!r}")
 
     run_wizard = False
     wizard_parallel = False
-    if provider_cfg.type != "deterministic":
+    if wizard_provider_cfg.type != "deterministic":
         run_wizard = _prompt_yes_no("Run setup wizard (AI) now?", default=True)
         if run_wizard:
             wizard_parallel = _prompt_yes_no("Wizard: generate per-agent packets in parallel?", default=True)
@@ -902,11 +953,15 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     actor_cfgs: list[ActorConfig] = []
     docs_by_actor: dict[str, dict[str, str]] = {}
     for i, agent in enumerate(agents, start=1):
+        override = provider_overrides.get(agent.actor_id)
+        if override is not None and override == pipeline_provider_cfg:
+            override = None
         actor_cfgs.append(
             ActorConfig(
                 actor_id=agent.actor_id,
                 packet_dir=agent.actor_id,
                 include_paths_in_prompt=True,
+                provider=override,
             )
         )
 
@@ -942,8 +997,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             delivery=delivery,
             interaction_notes=notes,
             artifacts_dir=wiz_dir,
-            timeout_s=provider_cfg.timeout_s,
-            idle_timeout_s=provider_cfg.idle_timeout_s,
+            timeout_s=wizard_provider_cfg.timeout_s,
+            idle_timeout_s=wizard_provider_cfg.idle_timeout_s,
             on_event=ui.on_event,
         )
         ui.finish()
@@ -976,8 +1031,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                     brief_md=brief_md,
                     base_docs=docs_by_actor[agent.actor_id],
                     artifacts_dir=gen_dir,
-                    timeout_s=provider_cfg.timeout_s,
-                    idle_timeout_s=provider_cfg.idle_timeout_s,
+                    timeout_s=wizard_provider_cfg.timeout_s,
+                    idle_timeout_s=wizard_provider_cfg.idle_timeout_s,
                     on_event=None,
                 )
                 if refined is None:
@@ -1006,8 +1061,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                         brief_md=brief_md,
                         base_docs=docs_by_actor[a.actor_id],
                         artifacts_dir=(orch_dir / "setup_artifacts" / f"wizard_{a.actor_id}"),
-                        timeout_s=provider_cfg.timeout_s,
-                        idle_timeout_s=provider_cfg.idle_timeout_s,
+                        timeout_s=wizard_provider_cfg.timeout_s,
+                        idle_timeout_s=wizard_provider_cfg.idle_timeout_s,
                         on_event=ui2.on_event,
                     )
                     ui2.finish()
@@ -1034,7 +1089,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
     pipeline = PipelineConfig(
         version=1,
-        provider=provider_cfg,
+        provider=pipeline_provider_cfg,
         actors=tuple(actor_cfgs),
         orchestration=orchestration,
         goal=goal,
