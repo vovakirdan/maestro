@@ -325,6 +325,10 @@ class OrchestratorEngine:
         git: GitPolicy | None = None,
         timeout_s_override: float | None = None,
         idle_timeout_s_override: float | None = None,
+        run_root_override: Path | None = None,
+        run_id_override: str | None = None,
+        emit_state_events: bool = False,
+        on_event_for_state: Callable[[JsonDict], None] | None = None,
     ) -> RunOutcome:
         def log(msg: str) -> None:
             if progress:
@@ -343,8 +347,15 @@ class OrchestratorEngine:
         if idle_timeout_override is not None and idle_timeout_override < 0:
             raise ValueError(f"idle_timeout_s must be >= 0, got: {idle_timeout_override}")
 
-        run_id = generate_run_id()
-        run_dir = self.orchestrator_dir / "runs" / run_id
+        if run_id_override is not None and run_id_override.strip():
+            run_id = run_id_override.strip()
+        else:
+            run_id = generate_run_id()
+
+        run_root = self.orchestrator_dir / "runs"
+        if run_root_override is not None:
+            run_root = Path(run_root_override).expanduser()
+        run_dir = run_root / run_id
         steps_dir = run_dir / "steps"
         timeline_path = run_dir / "timeline.jsonl"
         state_path = run_dir / "state.json"
@@ -356,11 +367,39 @@ class OrchestratorEngine:
         steps_dir.mkdir(parents=True, exist_ok=False)
         shutil.copytree(template_packets_dir, run_packets_dir)
 
+        total_actors = len(self.pipeline.actors)
+        now_utc = _now_iso_utc()
         state: JsonDict = {
             "run_id": run_id,
-            "started_at_utc": _now_iso_utc(),
+            "created_at_utc": now_utc,
+            "started_at_utc": now_utc,
+            "updated_at_utc": now_utc,
             "status": "RUNNING",
+            "task_id": self.task_id,
+            "goal": self.pipeline.goal,
+            "pipeline_path": (self.orchestrator_dir / "pipeline.json").as_posix(),
             "steps": [],
+            "current": {
+                "actor_id": None,
+                "step_name": None,
+                "attempt": None,
+                "preset": self.pipeline.orchestration.preset if self.pipeline.orchestration else "linear",
+                "is_retry": False,
+            },
+            "progress": {
+                "invocation_index": 0,
+                "attempts_done": 0,
+                "max_steps": total_actors,
+                "total_actor_count": total_actors,
+            },
+            "last_event": {
+                "type": "run_started",
+                "ts_utc": _now_iso_utc(),
+            },
+            "heartbeat": {
+                "updated_at_utc": _now_iso_utc(),
+                "last_log_line_ts": time.time(),
+            },
             "provider_timeouts": {
                 "timeout_s_override": timeout_override,
                 "idle_timeout_s_override": idle_timeout_override,
@@ -370,7 +409,104 @@ class OrchestratorEngine:
                 },
             },
         }
-        _write_json(state_path, state)
+
+        def _emit_state_for_daemon(event: str, payload: JsonDict | None = None) -> None:
+            if not emit_state_events or on_event_for_state is None:
+                return
+            ev: JsonDict = {
+                "type": "state_update",
+                "run_id": run_id,
+                "event": event,
+                "status": state.get("status"),
+                "current": state.get("current"),
+                "progress": state.get("progress"),
+                "last_event": state.get("last_event"),
+                "updated_at_utc": state.get("updated_at_utc"),
+            }
+            if payload:
+                ev["payload"] = payload
+            try:
+                on_event_for_state(ev)
+            except Exception:
+                # Keep execution independent from UI/state sinks.
+                pass
+
+        def _touch_state(event: str, payload: JsonDict | None = None) -> None:
+            now = _now_iso_utc()
+            state["updated_at_utc"] = now
+            state["heartbeat"] = {
+                "updated_at_utc": now,
+                "last_log_line_ts": time.time(),
+            }
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(state_path, state)
+            _emit_state_for_daemon(event, payload)
+
+        def _set_status(next_status: str, payload: JsonDict | None = None) -> None:
+            state["status"] = next_status
+            if next_status in {"OK", "FAILED", "NEEDS_INPUT"} and "finished_at_utc" not in state:
+                state["finished_at_utc"] = _now_iso_utc()
+            state["last_event"] = {
+                "type": f"run_{next_status.lower()}",
+                "ts_utc": _now_iso_utc(),
+            }
+            if payload:
+                state["last_event"]["payload"] = payload
+            _touch_state("run_status")
+
+        def _set_step(
+            *,
+            step_name: str,
+            actor_id: str,
+            attempt: int,
+            is_retry: bool,
+            invocation_index: int,
+        ) -> None:
+            current = state.get("current")
+            if not isinstance(current, dict):
+                current = {
+                    "actor_id": None,
+                    "step_name": None,
+                    "attempt": None,
+                    "preset": self.pipeline.orchestration.preset if self.pipeline.orchestration else "linear",
+                    "is_retry": False,
+                }
+            current["step_name"] = step_name
+            current["actor_id"] = actor_id
+            current["attempt"] = attempt
+            current["is_retry"] = bool(is_retry)
+            state["current"] = current
+            # Keep invocation index monotonic and explicit.
+            progress = state.get("progress")
+            if isinstance(progress, dict):
+                progress["invocation_index"] = max(int(invocation_index), 0)
+                state["progress"] = progress
+            state["last_event"] = {
+                "type": "attempt_started",
+                "step": step_name,
+                "actor_id": actor_id,
+                "attempt": attempt,
+                "ts_utc": _now_iso_utc(),
+            }
+            progress = state.get("progress")
+            if isinstance(progress, dict):
+                progress["attempts_done"] = int(progress.get("attempts_done", 0)) + 1
+                state["progress"] = progress
+            _touch_state("attempt_started")
+
+        def _set_last_note(summary: str, *, kind: str) -> None:
+            now = _now_iso_utc()
+            state["last_event"] = {
+                "type": kind,
+                "step": state.get("current", {}).get("step_name"),
+                "actor_id": state.get("current", {}).get("actor_id"),
+                "attempt": state.get("current", {}).get("attempt"),
+                "summary": summary,
+                "ts_utc": now,
+            }
+            _touch_state("run_event")
+
+        _touch_state("run_started")
         timeline.append({"type": "run_started", "run_id": run_id})
 
         workspace_root = self.workspace_dir
@@ -482,7 +618,7 @@ class OrchestratorEngine:
                 "clean": not kept,
                 "ignored_status_lines": list(ignored),
             }
-            _write_json(state_path, state)
+            _touch_state("state_update")
             timeline.append(
                 {
                     "type": "git_checked",
@@ -526,7 +662,7 @@ class OrchestratorEngine:
                     )
                 active_branch = _git_current_branch() or branch_name
                 state["git"]["run_branch"] = active_branch
-                _write_json(state_path, state)
+                _touch_state("state_update")
                 timeline.append(
                     {
                         "type": "git_branch_created",
@@ -630,7 +766,7 @@ class OrchestratorEngine:
                 if isinstance(entry, dict) and entry.get("step") == step_name:
                     entry["commit"] = commit
                     break
-            _write_json(state_path, state)
+            _touch_state("state_update")
 
             timeline.append(
                 {
@@ -790,7 +926,7 @@ class OrchestratorEngine:
 
         if plan_mode != "none":
             state["plan"] = {"mode": plan_mode, "present": bool(plan_text)}
-            _write_json(state_path, state)
+            _touch_state("state_update")
             if plan_text.strip():
                 if plan_mode == "user":
                     pdir = run_dir / "plan"
@@ -806,20 +942,29 @@ class OrchestratorEngine:
                         existing = "# INPUTS\n\n"
                     ipath.write_text(_with_plan(existing), encoding="utf-8")
 
-        qa_notes_file = self.orchestrator_dir / "QA_NOTES.md"
+        qa_notes_file = run_dir / "QA_NOTES.md"
+        qa_notes_legacy = self.orchestrator_dir / "QA_NOTES.md"
 
         def _read_qa_notes_for_prompt() -> tuple[str, str] | None:
-            try:
-                txt = qa_notes_file.read_text(encoding="utf-8")
-            except FileNotFoundError:
-                return None
-            if not txt.strip():
-                return None
-            body = txt.rstrip()
-            max_chars = 12000
-            if len(body) > max_chars:
-                body = body[:max_chars].rstrip() + "\n\n[truncated; see full file]\n"
-            return qa_notes_file.as_posix(), body + "\n"
+            for path in (qa_notes_file, qa_notes_legacy):
+                try:
+                    txt = path.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    continue
+                if not txt.strip():
+                    continue
+                body = txt.rstrip()
+                max_chars = 12000
+                if len(body) > max_chars:
+                    body = body[:max_chars].rstrip() + "\n\n[truncated; see full file]\n"
+                return path.as_posix(), body + "\n"
+            return None
+
+        def _qa_notes_path_for_instructions() -> str:
+            for p in (qa_notes_file, qa_notes_legacy):
+                if p.exists():
+                    return p.as_posix()
+            return qa_notes_file.as_posix()
 
         def _append_qa_notes(lines: list[str]) -> None:
             info = _read_qa_notes_for_prompt()
@@ -877,6 +1022,13 @@ class OrchestratorEngine:
             last_failure_kind: str = "format"
 
             for attempt in (1, 2):
+                _set_step(
+                    step_name=step_name,
+                    actor_id=actor_id,
+                    attempt=attempt,
+                    is_retry=attempt > 1,
+                    invocation_index=invocation_i,
+                )
                 attempt_dir = step_dir / f"attempt_{attempt}"
                 log(f"  {actor_id}: attempt {attempt}/2")
                 extra = None
@@ -884,7 +1036,7 @@ class OrchestratorEngine:
                     if last_failure_kind == "qa_notes_postcondition":
                         extra = (
                             "Your previous response was valid ORCH_JSON_V1, but you did not satisfy a required postcondition.\n"
-                            f"You MUST write a non-empty QA_NOTES.md at:\n{qa_notes_file.as_posix()}\n\n"
+                            f"You MUST write a non-empty QA_NOTES.md at:\n{_qa_notes_path_for_instructions()}\n\n"
                             "QA_NOTES.md must include:\n"
                             "- change summary (what changed, where)\n"
                             "- what to verify (manual scenarios + automated checks)\n"
@@ -943,7 +1095,7 @@ class OrchestratorEngine:
                         if not txt.strip():
                             post_ok = False
                             post_errors.append(
-                                f"QA_NOTES.md is missing or empty at {qa_notes_file.as_posix()}"
+                                f"QA_NOTES.md is missing or empty at {_qa_notes_path_for_instructions()}"
                             )
 
                 combined_ok = bool(v.ok and post_ok)
@@ -991,7 +1143,7 @@ class OrchestratorEngine:
                 if last_parsed_report.status == Status.OK and not txt.strip():
                     msg = (
                         "Escalation: qa_notes step returned OK, but QA_NOTES.md is missing or empty.\n"
-                        f"path={qa_notes_file.as_posix()}\n"
+                        f"path={_qa_notes_path_for_instructions()}\n"
                     )
                     validated_report = StructuredReport(
                         status=Status.NEEDS_INPUT,
@@ -1025,7 +1177,7 @@ class OrchestratorEngine:
                             "run_id": run_id,
                             "step": step_name,
                             "actor_id": actor_id,
-                            "path": qa_notes_file.as_posix(),
+                            "path": _qa_notes_path_for_instructions(),
                         }
                     )
 
@@ -1063,7 +1215,7 @@ class OrchestratorEngine:
                         "errors": list(attempt_errors),
                     }
                 )
-                _write_json(state_path, state)
+                _touch_state("state_update")
                 timeline.append(
                     {
                         "type": "step_failed",
@@ -1085,7 +1237,7 @@ class OrchestratorEngine:
                     "status": step_status.value,
                 }
             )
-            _write_json(state_path, state)
+            _touch_state("state_update")
             timeline.append(
                 {
                     "type": "step_finished",
@@ -1138,7 +1290,7 @@ class OrchestratorEngine:
                     overall_status = Status.FAILED
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1189,7 +1341,7 @@ class OrchestratorEngine:
                     )
                 state["status"] = overall_status.value
                 state["finished_at_utc"] = _now_iso_utc()
-                _write_json(state_path, state)
+                _touch_state("state_update")
                 timeline.append(
                     {
                         "type": "run_stopped",
@@ -1241,7 +1393,7 @@ class OrchestratorEngine:
                     overall_status = Status.FAILED
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1264,7 +1416,7 @@ class OrchestratorEngine:
                     overall_status = Status.FAILED
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1335,7 +1487,7 @@ class OrchestratorEngine:
                         )
                         state["status"] = overall_status.value
                         state["finished_at_utc"] = _now_iso_utc()
-                        _write_json(state_path, state)
+                        _touch_state("state_update")
                         timeline.append(
                             {
                                 "type": "run_stopped",
@@ -1393,7 +1545,7 @@ class OrchestratorEngine:
                             )
                             state["status"] = overall_status.value
                             state["finished_at_utc"] = _now_iso_utc()
-                            _write_json(state_path, state)
+                            _touch_state("state_update")
                             timeline.append(
                                 {
                                     "type": "run_stopped",
@@ -1444,7 +1596,7 @@ class OrchestratorEngine:
                             )
                             state["status"] = overall_status.value
                             state["finished_at_utc"] = _now_iso_utc()
-                            _write_json(state_path, state)
+                            _touch_state("state_update")
                             timeline.append(
                                 {
                                     "type": "run_stopped",
@@ -1560,7 +1712,7 @@ class OrchestratorEngine:
                     )
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1583,7 +1735,7 @@ class OrchestratorEngine:
                     overall_status = Status.FAILED
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1632,7 +1784,7 @@ class OrchestratorEngine:
                     )
                     state["status"] = overall_status.value
                     state["finished_at_utc"] = _now_iso_utc()
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     timeline.append(
                         {
                             "type": "run_stopped",
@@ -1673,7 +1825,7 @@ class OrchestratorEngine:
         if overall_status == Status.OK:
             state["status"] = overall_status.value
             state["finished_at_utc"] = _now_iso_utc()
-            _write_json(state_path, state)
+            _touch_state("state_update")
             timeline.append(
                 {"type": "run_finished", "run_id": run_id, "status": overall_status.value}
             )
@@ -1854,7 +2006,7 @@ class OrchestratorEngine:
                         }
                     )
                     state["escalation"] = {"present": True, "path": out_path.as_posix()}
-                    _write_json(state_path, state)
+                    _touch_state("state_update")
                     log(f"escalation: wrote {out_path}")
                 except Exception as e:
                     timeline.append(

@@ -499,6 +499,209 @@ def _check_qa_notes_postcondition(root: Path) -> list[Issue]:
     return []
 
 
+def _check_daemon_cli_parser(root: Path) -> list[Issue]:
+    sys.path.insert(0, str(root))
+    try:
+        from main import _parse_args
+    except Exception as e:
+        try:
+            sys.path.remove(str(root))
+        except ValueError:
+            pass
+        return [
+            Issue(
+                path=root / "main.py",
+                line=None,
+                code="CLIP001",
+                message=f"failed to import parser for daemon CLI checks: {e}",
+            )
+        ]
+
+    try:
+        ns = _parse_args(["run", "--workspace", str(root / "workspace"), "--async"])
+        if ns.cmd != "run" or not ns.async_mode:
+            return [
+                Issue(
+                    path=root / "main.py",
+                    line=None,
+                    code="CLIP002",
+                    message="run command must accept --async",
+                )
+            ]
+
+        ns = _parse_args(
+            ["daemon", "start", "--workspace", str(root / "workspace"), "--daemon-data-dir", str(root)]
+        )
+        if ns.daemon_cmd != "start":
+            return [
+                Issue(
+                    path=root / "main.py",
+                    line=None,
+                    code="CLIP003",
+                    message="daemon start parser broken",
+                )
+            ]
+
+        ns = _parse_args(
+            ["daemon", "stop", "--workspace", str(root / "workspace"), "--daemon-data-dir", str(root)]
+        )
+        if ns.daemon_cmd != "stop":
+            return [
+                Issue(
+                    path=root / "main.py",
+                    line=None,
+                    code="CLIP004",
+                    message="daemon stop parser must accept --daemon-data-dir",
+                )
+            ]
+
+        ns = _parse_args(
+            [
+                "run",
+                "--workspace",
+                str(root / "workspace"),
+                "--wait",
+                "--daemon-data-dir",
+                str(root),
+            ]
+        )
+        if ns.cmd != "run" or not ns.wait:
+            return [
+                Issue(
+                    path=root / "main.py",
+                    line=None,
+                    code="CLIP005",
+                    message="run parser must accept --wait",
+                )
+            ]
+        if ns.daemon_data_dir != str(root):
+            return [
+                Issue(
+                    path=root / "main.py",
+                    line=None,
+                    code="CLIP006",
+                    message="run parser should expose --daemon-data-dir",
+                )
+            ]
+    except SystemExit as e:
+        return [
+            Issue(
+                path=root / "main.py",
+                line=None,
+                code="CLIP000",
+                message=f"failed to parse daemon/daemon-run command in CLI checks: {e}",
+            )
+        ]
+    finally:
+        try:
+            sys.path.remove(str(root))
+        except ValueError:
+            pass
+
+    return []
+
+
+def _check_engine_external_run_root(root: Path) -> list[Issue]:
+    with tempfile.TemporaryDirectory(prefix="orch_daemon_root_") as td:
+        tmp_ws = Path(td) / "workspace"
+        tmp_ws.mkdir(parents=True, exist_ok=True)
+        orch = tmp_ws / "orchestrator"
+        packets = orch / "packets" / "coder"
+        packets.mkdir(parents=True)
+
+        pipeline = {
+            "version": 1,
+            "goal": "external-run-root-check",
+            "provider": {
+                "type": "deterministic",
+                "timeout_s": 1.0,
+                "idle_timeout_s": 1.0,
+            },
+            "actors": [
+                {
+                    "actor_id": "coder",
+                    "packet_dir": "coder",
+                    "include_paths_in_prompt": True,
+                }
+            ],
+        }
+        (orch / "pipeline.json").parent.mkdir(parents=True, exist_ok=True)
+        (orch / "pipeline.json").write_text(
+            json.dumps(pipeline, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        docs = {
+            "ROLE.md": "# ROLE\n\nCoder.\n",
+            "TARGET.md": "# TARGET\n\nNo-op implementation.\n",
+            "RULES.md": "# RULES\n\nReturn ORCH_JSON_V1 object.\n",
+            "CONTEXT.md": "# CONTEXT\n\nWorkspace context.\n",
+            "REPORT_FORMAT.md": (
+                "FORMAT: ORCH_JSON_V1\n\n"
+                "Return exactly one JSON object with keys: status, output, next_inputs.\n"
+            ),
+            "INPUTS.md": "# INPUTS\n\n",
+            "NOTES.md": "# NOTES\n\n",
+        }
+        for name, value in docs.items():
+            (packets / name).write_text(value, encoding="utf-8")
+
+        sys.path.insert(0, str(root))
+        try:
+            from src.core.types import Status
+            from src.orchestrator.engine import OrchestratorEngine
+        finally:
+            try:
+                sys.path.remove(str(root))
+            except ValueError:
+                pass
+
+        try:
+            engine = OrchestratorEngine.load(workspace_dir=tmp_ws)
+        except Exception as e:
+            return [
+                Issue(
+                    path=orch / "pipeline.json",
+                    line=None,
+                    code="DROOT001",
+                    message=f"failed to load engine for external run root check: {e}",
+                )
+            ]
+
+        run_root = tmp_ws / "daemon_runs"
+        outcome = engine.run(progress=None, run_root_override=run_root, run_id_override="ext_root_1")
+        if outcome.status != Status.OK:
+            return [
+                Issue(
+                    path=orch / "pipeline.json",
+                    line=None,
+                    code="DROOT002",
+                    message=f"engine run with external run_root_override ended with {outcome.status.value}",
+                )
+            ]
+
+        run_dir = run_root / "ext_root_1"
+        if not run_dir.exists():
+            return [
+                Issue(
+                    path=orch / "pipeline.json",
+                    line=None,
+                    code="DROOT003",
+                    message=f"run directory not found at external root: {run_dir}",
+                )
+            ]
+        for rel in ("state.json", "timeline.jsonl", "final.txt"):
+            if not (run_dir / rel).exists():
+                return [
+                    Issue(
+                        path=run_dir,
+                        line=None,
+                        code="DROOT004",
+                        message=f"missing external run artifact: {rel}",
+                    )
+                ]
+
+    return []
+
+
 def _run_external_tool(
     *,
     root: Path,
@@ -563,6 +766,8 @@ def main(argv: list[str] | None = None) -> int:
     all_issues.extend(_check_pipeline_orchestration_parsing(root))
     all_issues.extend(_check_pipeline_task_parsing(root))
     all_issues.extend(_check_qa_notes_postcondition(root))
+    all_issues.extend(_check_daemon_cli_parser(root))
+    all_issues.extend(_check_engine_external_run_root(root))
 
     if not args.no_example:
         all_issues.extend(_run_example_pipeline(root))
