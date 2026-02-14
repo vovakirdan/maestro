@@ -16,8 +16,10 @@ from src.core.runtime import ActorConfig, PipelineConfig, generate_run_id, load_
 from src.core.types import JsonDict, Status, StructuredReport
 from src.orchestrator.validator import ReportValidator, retry_instructions
 from src.providers.base import Provider
+from src.providers.claude_cli import ClaudeCLIProvider
 from src.providers.codex_cli import CodexCLIProvider
 from src.providers.deterministic import DeterministicProvider
+from src.providers.gemini_cli import GeminiCLIProvider
 
 
 def _now_iso_utc() -> str:
@@ -126,6 +128,12 @@ class OrchestratorEngine:
         if cfg.type == "codex_cli":
             assert cfg.command is not None
             return CodexCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
+        if cfg.type == "gemini_cli":
+            assert cfg.command is not None
+            return GeminiCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
+        if cfg.type == "claude_cli":
+            assert cfg.command is not None
+            return ClaudeCLIProvider(command=cfg.command, cwd=self.orchestrator_dir.parent)
         raise ValueError(f"Unsupported provider type: {cfg.type!r}")
 
     def run(

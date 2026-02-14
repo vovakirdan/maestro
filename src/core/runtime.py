@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from src.core.types import JsonDict
 
-ProviderType = Literal["deterministic", "codex_cli"]
+ProviderType = Literal["deterministic", "codex_cli", "gemini_cli", "claude_cli"]
 PresetType = Literal["crt_v1", "cr_v1", "linear_v1"]
 TaskKind = Literal["feature", "bug", "bootstrap", "other"]
 
@@ -45,10 +45,14 @@ class ProviderConfig:
     @staticmethod
     def from_dict(obj: dict[str, Any]) -> ProviderConfig:
         t = obj.get("type")
-        if t not in ("deterministic", "codex_cli"):
-            raise ValueError(f"provider.type must be 'deterministic' or 'codex_cli', got: {t!r}")
+        if t not in ("deterministic", "codex_cli", "gemini_cli", "claude_cli"):
+            raise ValueError(
+                "provider.type must be one of: "
+                "'deterministic', 'codex_cli', 'gemini_cli', 'claude_cli', got: "
+                f"{t!r}"
+            )
         command: tuple[str, ...] | None = None
-        if t == "codex_cli":
+        if t in {"codex_cli", "gemini_cli", "claude_cli"}:
             cmd = obj.get("command")
             if (
                 not isinstance(cmd, list)
@@ -56,7 +60,8 @@ class ProviderConfig:
                 or not all(isinstance(x, str) and x for x in cmd)
             ):
                 raise ValueError(
-                    "provider.command must be a non-empty list of strings for codex_cli"
+                    "provider.command must be a non-empty list of strings for "
+                    "codex_cli/gemini_cli/claude_cli"
                 )
             command = tuple(cmd)
         timeout_s = float(obj.get("timeout_s", 120.0))

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -28,8 +29,10 @@ from src.orchestrator.templates import get_template, list_template_ids
 from src.orchestrator.spec import AgentSpec
 from src.orchestrator.wizard import run_setup_wizard_analyze, run_setup_wizard_write_packet
 from src.providers.base import Provider
+from src.providers.claude_cli import ClaudeCLIProvider
 from src.providers.codex_cli import CodexCLIProvider
 from src.providers.deterministic import DeterministicProvider
+from src.providers.gemini_cli import GeminiCLIProvider
 
 
 def _prompt_line(label: str, *, default: str | None = None) -> str:
@@ -765,20 +768,52 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
     interaction_notes = _prompt_multiline_optional("Workflow/interaction notes")
 
-    use_codex = _prompt_yes_no("Do you want Codex CLI as provider?", default=False)
-    if use_codex:
+    # Provider selection (only offer installed CLIs).
+    choices: list[str] = ["deterministic"]
+    if shutil.which("codex") is not None:
+        choices.append("codex_cli")
+    if shutil.which("gemini") is not None:
+        choices.append("gemini_cli")
+    if shutil.which("claude") is not None:
+        choices.append("claude_cli")
+
+    provider_type = _prompt_choice(
+        f"Provider ({'/'.join(choices)})",
+        choices=choices,
+        default="deterministic",
+    )
+
+    provider_cfg: ProviderConfig
+    if provider_type == "codex_cli":
         cmd_raw = _prompt_line(
-            "Codex command (space-separated)",
+            "Codex command (shell syntax)",
             default="codex exec --json --full-auto",
         )
-        command = tuple(cmd_raw.split())
+        command = tuple(shlex.split(cmd_raw))
         if "--json" not in command:
             print("WARN: Codex command does not include '--json'; JSONL parsing may fail.")
+        provider_cfg = ProviderConfig(type="codex_cli", command=command, timeout_s=0.0, idle_timeout_s=600.0)
+    elif provider_type == "gemini_cli":
+        cmd_raw = _prompt_line(
+            "Gemini command (shell syntax)",
+            default='gemini --output-format text --approval-mode yolo -p " "',
+        )
+        command = tuple(shlex.split(cmd_raw))
         provider_cfg = ProviderConfig(
-            type="codex_cli",
+            type="gemini_cli",
             command=command,
-            # Default to no hard timeout; rely on idle timeout for safety.
-            # This avoids killing long-running but active runs (e.g. 30+ minutes).
+            timeout_s=0.0,
+            idle_timeout_s=600.0,
+        )
+    elif provider_type == "claude_cli":
+        cmd_raw = _prompt_line(
+            "Claude command (shell syntax)",
+            default="claude -p --output-format text --input-format text --permission-mode acceptEdits",
+        )
+        command = tuple(shlex.split(cmd_raw))
+        provider_cfg = ProviderConfig(
+            type="claude_cli",
+            command=command,
             timeout_s=0.0,
             idle_timeout_s=600.0,
         )
@@ -843,20 +878,26 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
     # Provider instance for wizarding/refinement.
     provider: Provider
-    if provider_cfg.type == "codex_cli":
+    if provider_cfg.type == "deterministic":
+        provider = DeterministicProvider()
+    elif provider_cfg.type == "codex_cli":
         assert provider_cfg.command is not None
         provider = CodexCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
+    elif provider_cfg.type == "gemini_cli":
+        assert provider_cfg.command is not None
+        provider = GeminiCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
+    elif provider_cfg.type == "claude_cli":
+        assert provider_cfg.command is not None
+        provider = ClaudeCLIProvider(command=provider_cfg.command, cwd=workspace_dir)
     else:
-        provider = DeterministicProvider()
+        raise ValueError(f"Unsupported provider type: {provider_cfg.type!r}")
 
     run_wizard = False
     wizard_parallel = False
-    if provider_cfg.type == "codex_cli":
+    if provider_cfg.type != "deterministic":
         run_wizard = _prompt_yes_no("Run setup wizard (AI) now?", default=True)
         if run_wizard:
-            wizard_parallel = _prompt_yes_no(
-                "Wizard: generate per-agent packets in parallel?", default=True
-            )
+            wizard_parallel = _prompt_yes_no("Wizard: generate per-agent packets in parallel?", default=True)
 
     actor_cfgs: list[ActorConfig] = []
     docs_by_actor: dict[str, dict[str, str]] = {}

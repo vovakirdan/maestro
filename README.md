@@ -104,6 +104,10 @@ Providers:
 - `deterministic`: offline provider for predictable runs.
 - `codex_cli`: shells out to a configurable Codex CLI command and parses JSONL from stdout.
   Recommended command: `codex exec --json --full-auto`.
+- `gemini_cli`: shells out to `gemini` (Gemini CLI). Recommended command:
+  `gemini --output-format text --approval-mode yolo -p " "`.
+- `claude_cli`: shells out to `claude` (Claude Code CLI). Recommended command:
+  `claude -p --output-format text --input-format text --permission-mode acceptEdits`.
 
 Example (offline):
 
