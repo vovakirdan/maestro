@@ -23,6 +23,18 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             default="workspace",
             help="Workspace directory containing ./orchestrator (default: ./workspace).",
         )
+    run_p.add_argument(
+        "--timeout-s",
+        type=float,
+        default=None,
+        help="Override provider hard timeout seconds (0 disables hard timeout).",
+    )
+    run_p.add_argument(
+        "--idle-timeout-s",
+        type=float,
+        default=None,
+        help="Override provider idle timeout seconds (0 disables idle timeout).",
+    )
     return p.parse_args(argv)
 
 
@@ -320,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
                 on_event=ui.on_event,
                 plan=plan_req,
                 git=git_policy,
+                timeout_s_override=args.timeout_s,
+                idle_timeout_s_override=args.idle_timeout_s,
             )
             ui.finish()
             print("")

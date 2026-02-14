@@ -95,6 +95,8 @@ class OrchestratorEngine:
         on_event: Callable[[JsonDict], None] | None = None,
         plan: PlanRequest | None = None,
         git: GitPolicy | None = None,
+        timeout_s_override: float | None = None,
+        idle_timeout_s_override: float | None = None,
     ) -> RunOutcome:
         def log(msg: str) -> None:
             if progress:
@@ -102,6 +104,21 @@ class OrchestratorEngine:
 
         provider = self._make_provider()
         validator = ReportValidator()
+
+        timeout_s = (
+            float(timeout_s_override)
+            if timeout_s_override is not None
+            else self.pipeline.provider.timeout_s
+        )
+        idle_timeout_s = (
+            float(idle_timeout_s_override)
+            if idle_timeout_s_override is not None
+            else self.pipeline.provider.idle_timeout_s
+        )
+        if timeout_s < 0:
+            raise ValueError(f"timeout_s must be >= 0, got: {timeout_s}")
+        if idle_timeout_s < 0:
+            raise ValueError(f"idle_timeout_s must be >= 0, got: {idle_timeout_s}")
 
         run_id = generate_run_id()
         run_dir = self.orchestrator_dir / "runs" / run_id
@@ -121,6 +138,7 @@ class OrchestratorEngine:
             "started_at_utc": _now_iso_utc(),
             "status": "RUNNING",
             "steps": [],
+            "provider_timeouts": {"timeout_s": timeout_s, "idle_timeout_s": idle_timeout_s},
         }
         _write_json(state_path, state)
         timeline.append({"type": "run_started", "run_id": run_id})
@@ -162,6 +180,38 @@ class OrchestratorEngine:
             out = (p.stdout or "").strip()
             return (out == ""), out
 
+        def _git_filter_status_lines(
+            status_porcelain: str, *, allow_prefixes: tuple[str, ...]
+        ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+            kept: list[str] = []
+            ignored: list[str] = []
+
+            for raw in status_porcelain.splitlines():
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+
+                # Porcelain v1 usually looks like: "XY <path>" or "?? <path>".
+                path = ""
+                if len(line) >= 4 and line[2] == " ":
+                    path = line[3:]
+
+                def is_allowed(p: str) -> bool:
+                    p = p.strip()
+                    if not p:
+                        return False
+                    if " -> " in p:
+                        old, new = p.split(" -> ", 1)
+                        return is_allowed(old) and is_allowed(new)
+                    return any(p.startswith(prefix) for prefix in allow_prefixes)
+
+                if path and is_allowed(path):
+                    ignored.append(line)
+                else:
+                    kept.append(line)
+
+            return tuple(kept), tuple(ignored)
+
         # Optional git safety policy (check cleanliness / create a dedicated branch for the run).
         if git is not None and git.mode != "off":
             repo_root = _git_repo_root()
@@ -174,10 +224,19 @@ class OrchestratorEngine:
                 )
 
             clean, details = _git_is_clean()
-            if not clean:
+            # The orchestrator control dir is typically untracked and should not block branch safety.
+            # We still enforce cleanliness for the rest of the workspace.
+            kept, ignored = _git_filter_status_lines(details, allow_prefixes=("orchestrator/",))
+            if not clean and kept:
                 raise ValueError(
                     "Workspace has uncommitted changes; commit/stash first or disable git policy. "
-                    f"status_porcelain:\n{details}"
+                    "status_porcelain:\n"
+                    + "\n".join(kept)
+                )
+            if not clean and ignored:
+                log(
+                    "WARN: git policy ignoring uncommitted changes under orchestrator/ "
+                    f"({len(ignored)} line(s))"
                 )
 
             original_branch = _git_current_branch() or "unknown"
@@ -185,7 +244,8 @@ class OrchestratorEngine:
                 "mode": git.mode,
                 "repo_root": repo_root.as_posix(),
                 "original_branch": original_branch,
-                "clean": True,
+                "clean": not kept,
+                "ignored_status_lines": list(ignored),
             }
             _write_json(state_path, state)
             timeline.append(
@@ -305,8 +365,8 @@ class OrchestratorEngine:
                     res = provider.run(
                         plan_prompt,
                         artifacts_dir=plan_dir,
-                        timeout_s=self.pipeline.provider.timeout_s,
-                        idle_timeout_s=self.pipeline.provider.idle_timeout_s,
+                        timeout_s=timeout_s,
+                        idle_timeout_s=idle_timeout_s,
                         on_event=plan_event_cb,
                     )
                     plan_text = res.final_text.strip()
@@ -414,8 +474,8 @@ class OrchestratorEngine:
 
                 res = actor.run(
                     artifacts_dir=attempt_dir,
-                    timeout_s=self.pipeline.provider.timeout_s,
-                    idle_timeout_s=self.pipeline.provider.idle_timeout_s,
+                    timeout_s=timeout_s,
+                    idle_timeout_s=idle_timeout_s,
                     extra_instructions=extra,
                     on_event=provider_event_cb,
                 )

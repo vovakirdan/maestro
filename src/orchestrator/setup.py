@@ -624,17 +624,21 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         provider_cfg = ProviderConfig(
             type="codex_cli",
             command=command,
-            timeout_s=600.0,
-            idle_timeout_s=300.0,
+            # Default to no hard timeout; rely on idle timeout for safety.
+            # This avoids killing long-running but active runs (e.g. 30+ minutes).
+            timeout_s=0.0,
+            idle_timeout_s=600.0,
         )
     else:
         provider_cfg = ProviderConfig(type="deterministic")
 
     timeout_s = float(
-        _prompt_line("Hard timeout seconds", default=str(int(provider_cfg.timeout_s)))
+        _prompt_line(
+            "Hard timeout seconds (0=disabled)", default=str(int(provider_cfg.timeout_s))
+        )
     )
     idle_timeout_s = float(
-        _prompt_line("Idle timeout seconds", default=str(int(provider_cfg.idle_timeout_s)))
+        _prompt_line("Idle timeout seconds (0=disabled)", default=str(int(provider_cfg.idle_timeout_s)))
     )
     provider_cfg = ProviderConfig(
         type=provider_cfg.type,

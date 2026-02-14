@@ -5,6 +5,11 @@ Commands:
     python3 main.py setup
     python3 main.py run
 
+Timeouts:
+- The provider has two timeouts: `timeout_s` (hard wall-clock) and `idle_timeout_s` (no stdout/stderr).
+- Set either to `0` to disable it.
+- For long-running Codex runs, prefer `timeout_s=0` (no hard limit) and keep a reasonable `idle_timeout_s`.
+
 Setup presets:
 - `crt` (coder -> reviewer -> tester): runs reviewer/tester validation and routes FAILED feedback back to coder.
   Stops and escalates after `max_returns` returns to the coder.
@@ -54,6 +59,11 @@ Providers:
 Example (offline):
 
     python3 main.py run --workspace example/workspace
+
+Run overrides:
+
+    # Disable hard timeout, keep idle timeout at 10 minutes.
+    python3 main.py run --workspace /path/to/workspace --timeout-s 0 --idle-timeout-s 600
 
 Checks / lint (stdlib-only):
 
