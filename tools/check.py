@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import py_compile
 import re
 import shutil
@@ -390,6 +391,114 @@ def _check_pipeline_task_parsing(root: Path) -> list[Issue]:
     return []
 
 
+def _check_qa_notes_postcondition(root: Path) -> list[Issue]:
+    """
+    Unit-style check: qa_notes stage must produce QA_NOTES.md when it returns OK.
+
+    DeterministicProvider does not write files, so the engine should stop with NEEDS_INPUT
+    and write NEEDS_INPUT.md. Escalation wizard should be skipped (no non-deterministic provider).
+    """
+    with tempfile.TemporaryDirectory(prefix="orch_qanotes_") as td:
+        tmp_ws = Path(td) / "workspace"
+        tmp_ws.mkdir(parents=True, exist_ok=True)
+
+        orch_root = tmp_ws / "orchestrator"
+        task_id = "task_1"
+        task_dir = orch_root / "tasks" / task_id
+        packets_dir = task_dir / "packets" / "qa_notes"
+        runs_dir = task_dir / "runs"
+        packets_dir.mkdir(parents=True, exist_ok=True)
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (orch_root / "CURRENT_TASK").parent.mkdir(parents=True, exist_ok=True)
+        (orch_root / "CURRENT_TASK").write_text(task_id + "\n", encoding="utf-8")
+
+        report_format = (
+            "FORMAT: ORCH_JSON_V1\n\n"
+            "Return exactly one JSON object with keys: status, output, next_inputs.\n"
+        )
+
+        docs = {
+            "ROLE.md": "# ROLE\n\nWrite QA notes.\n",
+            "TARGET.md": "# TARGET\n\nWrite QA_NOTES.md.\n",
+            "RULES.md": "# RULES\n\nFollow REPORT_FORMAT.\n",
+            "CONTEXT.md": "# CONTEXT\n\nQA_NOTES.md path is under the task control dir.\n",
+            "REPORT_FORMAT.md": report_format,
+            "INPUTS.md": "# INPUTS\n\n\n",
+            "NOTES.md": "# NOTES\n\n\n",
+        }
+        for name, text in docs.items():
+            (packets_dir / name).write_text(text, encoding="utf-8")
+
+        pipeline = {
+            "version": 1,
+            "goal": "G",
+            "provider": {"type": "deterministic", "timeout_s": 1.0, "idle_timeout_s": 1.0},
+            "actors": [
+                {"actor_id": "qa_notes", "packet_dir": "qa_notes", "include_paths_in_prompt": True}
+            ],
+        }
+        (task_dir / "pipeline.json").parent.mkdir(parents=True, exist_ok=True)
+        (task_dir / "pipeline.json").write_text(
+            json.dumps(pipeline, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        # Import project code by adding repo root to sys.path (no packaging required).
+        sys.path.insert(0, str(root))
+        try:
+            from src.core.types import Status
+            from src.orchestrator.engine import OrchestratorEngine
+        finally:
+            try:
+                sys.path.remove(str(root))
+            except ValueError:
+                pass
+
+        try:
+            engine = OrchestratorEngine.load(workspace_dir=tmp_ws)
+            outcome = engine.run(progress=None)
+        except Exception as e:
+            return [
+                Issue(
+                    path=root / "src" / "orchestrator" / "engine.py",
+                    line=None,
+                    code="QA001",
+                    message=f"qa_notes postcondition run failed: {e}",
+                )
+            ]
+
+        if outcome.status != Status.NEEDS_INPUT:
+            return [
+                Issue(
+                    path=root / "src" / "orchestrator" / "engine.py",
+                    line=None,
+                    code="QA002",
+                    message=f"Expected NEEDS_INPUT for qa_notes postcondition, got: {outcome.status.value!r}",
+                )
+            ]
+
+        if not (outcome.run_dir / "NEEDS_INPUT.md").exists():
+            return [
+                Issue(
+                    path=outcome.run_dir,
+                    line=None,
+                    code="QA003",
+                    message="Expected NEEDS_INPUT.md to be written",
+                )
+            ]
+
+        if (outcome.run_dir / "escalation" / "escalation.md").exists():
+            return [
+                Issue(
+                    path=outcome.run_dir,
+                    line=None,
+                    code="QA004",
+                    message="Expected escalation.md to be absent (deterministic provider)",
+                )
+            ]
+
+    return []
+
+
 def _run_external_tool(
     *,
     root: Path,
@@ -453,6 +562,7 @@ def main(argv: list[str] | None = None) -> int:
     all_issues.extend(_check_codex_jsonl_extraction(root))
     all_issues.extend(_check_pipeline_orchestration_parsing(root))
     all_issues.extend(_check_pipeline_task_parsing(root))
+    all_issues.extend(_check_qa_notes_postcondition(root))
 
     if not args.no_example:
         all_issues.extend(_run_example_pipeline(root))

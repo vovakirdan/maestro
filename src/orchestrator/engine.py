@@ -782,6 +782,32 @@ class OrchestratorEngine:
                         existing = "# INPUTS\n\n"
                     ipath.write_text(_with_plan(existing), encoding="utf-8")
 
+        qa_notes_file = self.orchestrator_dir / "QA_NOTES.md"
+
+        def _read_qa_notes_for_prompt() -> tuple[str, str] | None:
+            try:
+                txt = qa_notes_file.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+            if not txt.strip():
+                return None
+            body = txt.rstrip()
+            max_chars = 12000
+            if len(body) > max_chars:
+                body = body[:max_chars].rstrip() + "\n\n[truncated; see full file]\n"
+            return qa_notes_file.as_posix(), body + "\n"
+
+        def _append_qa_notes(lines: list[str]) -> None:
+            info = _read_qa_notes_for_prompt()
+            if info is None:
+                return
+            path, body = info
+            lines.append("QA notes:")
+            lines.append(f"- path: {path}")
+            lines.append("")
+            lines.append(body.rstrip())
+            lines.append("")
+
         def write_inputs(packet_dir: Path, content: str) -> None:
             path = packet_dir / "INPUTS.md"
             path.write_text(_with_plan(content), encoding="utf-8")
@@ -823,13 +849,27 @@ class OrchestratorEngine:
             attempt_errors: tuple[str, ...] = tuple()
             validated_report: StructuredReport | None = None
             validated_text: str = ""
+            last_parsed_report: StructuredReport | None = None
+            last_failure_kind: str = "format"
 
             for attempt in (1, 2):
                 attempt_dir = step_dir / f"attempt_{attempt}"
                 log(f"  {actor_id}: attempt {attempt}/2")
                 extra = None
                 if attempt == 2:
-                    extra = retry_instructions(attempt_errors)
+                    if last_failure_kind == "qa_notes_postcondition":
+                        extra = (
+                            "Your previous response was valid ORCH_JSON_V1, but you did not satisfy a required postcondition.\n"
+                            f"You MUST write a non-empty QA_NOTES.md at:\n{qa_notes_file.as_posix()}\n\n"
+                            "QA_NOTES.md must include:\n"
+                            "- change summary (what changed, where)\n"
+                            "- what to verify (manual scenarios + automated checks)\n"
+                            "- drift/regression areas\n"
+                            "- known limitations / risky assumptions\n\n"
+                            "Then return ORCH_JSON_V1 JSON (exactly one object; no extra text).\n"
+                        )
+                    else:
+                        extra = retry_instructions(attempt_errors)
 
                 def provider_event_cb(
                     ev: JsonDict,
@@ -866,11 +906,30 @@ class OrchestratorEngine:
                 v = validator.validate(
                     report_format_text=report_format_text, output_text=validated_text
                 )
+
+                post_ok = True
+                post_errors: list[str] = []
+                if v.ok and v.report is not None:
+                    last_parsed_report = v.report
+                    if actor_id == "qa_notes" and v.report.status == Status.OK:
+                        try:
+                            txt = qa_notes_file.read_text(encoding="utf-8")
+                        except FileNotFoundError:
+                            txt = ""
+                        if not txt.strip():
+                            post_ok = False
+                            post_errors.append(
+                                f"QA_NOTES.md is missing or empty at {qa_notes_file.as_posix()}"
+                            )
+
+                combined_ok = bool(v.ok and post_ok)
+                combined_errors = list(v.errors) + post_errors
                 _write_json(
                     attempt_dir / "validation.json",
                     {
-                        "ok": v.ok,
-                        "errors": list(v.errors),
+                        "ok": combined_ok,
+                        "errors": combined_errors,
+                        "postcondition_ok": post_ok,
                         "provider_metadata": res.metadata,
                     },
                 )
@@ -881,17 +940,70 @@ class OrchestratorEngine:
                         "step": step_name,
                         "actor_id": actor_id,
                         "attempt": attempt,
-                        "validation_ok": v.ok,
+                        "validation_ok": combined_ok,
+                        "postcondition_ok": post_ok,
                         "provider_metadata": res.metadata,
                     }
                 )
 
-                if v.ok and v.report is not None:
+                if combined_ok and v.report is not None:
                     log(f"  {actor_id}: attempt {attempt}/2 validation OK")
                     validated_report = v.report
                     break
-                log(f"  {actor_id}: attempt {attempt}/2 validation FAILED")
-                attempt_errors = v.errors
+                if not v.ok:
+                    log(f"  {actor_id}: attempt {attempt}/2 validation FAILED")
+                    last_failure_kind = "format"
+                else:
+                    log(f"  {actor_id}: attempt {attempt}/2 postcondition FAILED")
+                    last_failure_kind = "qa_notes_postcondition"
+                attempt_errors = tuple(combined_errors)
+
+            if validated_report is None and actor_id == "qa_notes" and last_parsed_report is not None:
+                # If the agent reported OK but did not produce QA_NOTES.md, stop with NEEDS_INPUT.
+                try:
+                    txt = qa_notes_file.read_text(encoding="utf-8")
+                except FileNotFoundError:
+                    txt = ""
+                if last_parsed_report.status == Status.OK and not txt.strip():
+                    msg = (
+                        "Escalation: qa_notes step returned OK, but QA_NOTES.md is missing or empty.\n"
+                        f"path={qa_notes_file.as_posix()}\n"
+                    )
+                    validated_report = StructuredReport(
+                        status=Status.NEEDS_INPUT,
+                        output=msg,
+                        next_inputs=(
+                            "Please allow the agent to write the QA notes file, or provide the QA notes content.\n"
+                            "Minimum required content:\n"
+                            "- change summary (what changed, where)\n"
+                            "- what to verify (manual scenarios + automated checks)\n"
+                            "- drift/regression areas\n"
+                            "- known limitations / risky assumptions\n"
+                        ),
+                        artifacts=(),
+                    )
+                    validated_text = (
+                        json.dumps(
+                            {
+                                "status": validated_report.status.value,
+                                "output": validated_report.output,
+                                "next_inputs": validated_report.next_inputs,
+                                "artifacts": list(validated_report.artifacts),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                    timeline.append(
+                        {
+                            "type": "qa_notes_missing",
+                            "run_id": run_id,
+                            "step": step_name,
+                            "actor_id": actor_id,
+                            "path": qa_notes_file.as_posix(),
+                        }
+                    )
 
             # Canonical step outputs.
             (step_dir / "final.txt").write_text(validated_text, encoding="utf-8")
@@ -1025,12 +1137,22 @@ class OrchestratorEngine:
                     if i < len(self.pipeline.actors):
                         next_cfg = self.pipeline.actors[i]
                         next_packet_dir = run_packets_dir / next_cfg.packet_dir
-                        handoff = "# INPUTS\n\nUpstream report:\n\n" + report.output.rstrip() + "\n"
+                        lines: list[str] = ["# INPUTS", ""]
+                        lines.append("Upstream report:")
+                        lines.append("")
+                        lines.append(report.output.rstrip())
+                        lines.append("")
                         if report.next_inputs.strip():
-                            handoff += "\nUpstream handoff:\n\n" + report.next_inputs.rstrip() + "\n"
+                            lines.append("Upstream handoff:")
+                            lines.append("")
+                            lines.append(report.next_inputs.rstrip())
+                            lines.append("")
                         if _commit:
-                            handoff += "\nCommit:\n" f"- { _commit }\n"
-                        write_inputs(next_packet_dir, handoff)
+                            lines.append("Commit:")
+                            lines.append(f"- {_commit}")
+                            lines.append("")
+                        _append_qa_notes(lines)
+                        write_inputs(next_packet_dir, "\n".join(lines).rstrip() + "\n")
                     continue
 
                 overall_status = report.status
@@ -1380,6 +1502,7 @@ class OrchestratorEngine:
                         parts.append(f"- git show --stat {last_commit}")
                         parts.append(f"- git show {last_commit}")
                         parts.append("")
+                    _append_qa_notes(parts)
                     parts.append("Workspace:")
                     parts.append("- Inspect the workspace for the actual changes.")
                     write_inputs(next_packet_dir, "\n".join(parts).rstrip() + "\n")

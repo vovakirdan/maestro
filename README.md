@@ -75,15 +75,15 @@ Setup flow:
 - Each `setup` creates a new task folder under `orchestrator/tasks/<task_id>/` and updates `orchestrator/CURRENT_TASK`.
 
 Workflow presets:
-- `crt`: coder -> reviewer -> tester. If reviewer/tester returns `FAILED`, the run routes back to coder.
-  Escalates to NEEDS_INPUT after `max_returns`.
+- `crt`: coder -> reviewer -> (optional qa_notes) -> manual_tester/auto_tester (choose manual/auto/both).
+  If reviewer/tester returns `FAILED`, the run routes back to coder. Escalates to NEEDS_INPUT after `max_returns`.
 - `cr`: coder -> reviewer. If reviewer returns `FAILED`, the run routes back to coder.
   Escalates to NEEDS_INPUT after `max_returns`.
 - `c`: coder only.
 - `r`: reviewer only.
-- `t`: tester only.
+- `t`: tester only (choose manual or auto).
 - `d`: devops only.
-- `custom`: 1-6 stages, choose templates (`coder/reviewer/tester/devops/custom`) and optionally configure
+- `custom`: 1-6 stages, choose templates (`coder/reviewer/manual_tester/auto_tester/qa_notes/devops/custom`) and optionally configure
   a linear return-on-failure loop.
 - `other` (custom stage template): requires a role description (multiline) so the setup wizard can produce good packets.
   Use this when the built-ins do not fit but you still want structured setup.

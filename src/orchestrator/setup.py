@@ -127,6 +127,17 @@ def _prompt_multiline_required(label: str) -> str:
         print("Please provide a non-empty description (end with a single '.' line).")
 
 
+def _append_md_section(md: str, *, heading: str, body: str) -> str:
+    md = (md or "").rstrip()
+    body = (body or "").strip()
+    if not body:
+        return md + ("\n" if md else "")
+    section = f"## {heading}\n\n{body}\n"
+    if not md:
+        return section
+    return md.rstrip() + "\n\n" + section
+
+
 class _SetupRefineUI:
     def __init__(self, *, label: str) -> None:
         self._label = label
@@ -276,7 +287,7 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- Ensure validation covers both the new behavior and key existing behavior.\n"
                 "- Call out missing edge cases and failure-mode handling.\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific guardrails (feature):\n"
                 "- Include regression coverage for existing user flows near the change.\n"
@@ -299,7 +310,7 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- Ensure there is regression coverage (test or precise repro/verification).\n"
                 "- Look for new edge cases introduced by the fix (nulls, retries, races, boundaries).\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific guardrails (bug):\n"
                 "- Capture repro steps and verify the fix closes them.\n"
@@ -321,7 +332,7 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- Look for unsafe defaults, missing error handling, and unclear boundaries.\n"
                 "- Prefer a minimal, runnable baseline over partial, speculative scaffolding.\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific guardrails (bootstrap):\n"
                 "- Define acceptance tests that prove the project works end-to-end.\n"
@@ -345,7 +356,7 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- If changes are required, write next_inputs as a checklist with one action per bullet.\n"
                 "- Call out regression risks and missing validation explicitly.\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific deliverables (feature):\n"
                 "- Include regression scenarios; focus on highest-risk paths.\n"
@@ -364,7 +375,7 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- Require a root-cause explanation and regression coverage (test or precise steps).\n"
                 "- Use severity tags and a one-action-per-bullet checklist in next_inputs.\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific deliverables (bug):\n"
                 "- Provide a crisp repro and a boundary-focused regression set.\n"
@@ -382,7 +393,7 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "- Call out missing requirements, unclear acceptance criteria, or unsafe defaults.\n"
                 "- If rejecting, next_inputs must be a one-action-per-bullet checklist.\n"
             )
-        if template_id == "tester":
+        if template_id in {"tester", "manual_tester", "auto_tester"}:
             return (
                 "Task-specific deliverables (bootstrap):\n"
                 "- Provide smoke tests / acceptance tests for the baseline.\n"
@@ -409,6 +420,7 @@ def _task_context_appendix(task: TaskConfig | None) -> str:
 def _base_packet_docs(
     *,
     workspace_dir: Path,
+    task_orchestrator_dir: Path,
     goal: str,
     task: TaskConfig | None,
     agent: AgentSpec,
@@ -465,11 +477,14 @@ def _base_packet_docs(
     if task_rules_extra.strip():
         rules_md = rules_md.rstrip() + "\n\n" + task_rules_extra.rstrip() + "\n"
 
+    qa_notes_path = (task_orchestrator_dir / "QA_NOTES.md").as_posix()
     context_md = (
         context_md.rstrip()
         + "\n\n"
         + f"Goal: {goal}\n"
         + f"Workspace root: {workspace_dir.as_posix()}\n"
+        + f"Task control dir: {task_orchestrator_dir.as_posix()}\n"
+        + f"QA_NOTES.md path: {qa_notes_path}\n"
         + "\n"
     )
     task_ctx = _task_context_appendix(task)
@@ -499,6 +514,14 @@ def _base_packet_docs(
             "# INPUTS\n\n"
             "This file will contain any material you should act on for this step.\n"
             "If it is empty/insufficient, set status=NEEDS_INPUT.\n"
+        )
+
+    if agent.template_id == "qa_notes":
+        target_md = (
+            target_md.rstrip()
+            + "\n\n"
+            + "Required file:\n"
+            + f"- {qa_notes_path}\n"
         )
 
     return {
@@ -712,20 +735,31 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             max_value=10,
             default=3,
         )
-        for template_id in ("coder", "reviewer", "tester"):
-            specialization = _prompt_optional_line(f"Specialization for {template_id} (optional)")
+        testers = _prompt_choice(
+            "Testers in workflow (manual/auto/both)",
+            choices=["manual", "auto", "both"],
+            default="manual",
+        )
+
+        stages: list[tuple[str, str]] = [("coder", "coder"), ("reviewer", "reviewer")]
+        return_from: list[str] = ["reviewer"]
+        if testers in {"manual", "both"}:
+            stages.append(("manual_tester", "manual_tester"))
+            return_from.append("manual_tester")
+        if testers in {"auto", "both"}:
+            stages.append(("auto_tester", "auto_tester"))
+            return_from.append("auto_tester")
+
+        for actor_id, template_id in stages:
+            specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
             agents.append(
-                AgentSpec(
-                    actor_id=template_id,
-                    template_id=template_id,
-                    specialization=specialization,
-                )
+                AgentSpec(actor_id=actor_id, template_id=template_id, specialization=specialization)
             )
         orchestration = OrchestrationConfig(
             preset="linear_v1",
             max_returns=max_returns,
             return_to="coder",
-            return_from=("reviewer", "tester"),
+            return_from=tuple(return_from),
         )
 
     elif preset == "cr":
@@ -762,8 +796,29 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         )
 
     elif preset == "t":
-        specialization = _prompt_optional_line("Specialization for tester (optional)")
-        agents.append(AgentSpec(actor_id="tester", template_id="tester", specialization=specialization))
+        tester_type = _prompt_choice(
+            "Tester type (manual/auto)",
+            choices=["manual", "auto"],
+            default="manual",
+        )
+        if tester_type == "auto":
+            specialization = _prompt_optional_line("Specialization for auto_tester (optional)")
+            agents.append(
+                AgentSpec(
+                    actor_id="auto_tester",
+                    template_id="auto_tester",
+                    specialization=specialization,
+                )
+            )
+        else:
+            specialization = _prompt_optional_line("Specialization for manual_tester (optional)")
+            agents.append(
+                AgentSpec(
+                    actor_id="manual_tester",
+                    template_id="manual_tester",
+                    specialization=specialization,
+                )
+            )
 
     elif preset == "d":
         specialization = _prompt_optional_line("Specialization for devops (optional)")
@@ -778,7 +833,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             max_value=6,
             default=2,
         )
-        template_ids = list_template_ids() + ["other", "custom"]
+        template_ids = [t for t in list_template_ids() if t != "tester"] + ["other", "custom"]
         used_actor_ids: set[str] = set()
 
         for i in range(1, stage_count + 1):
@@ -789,6 +844,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             )
 
             default_actor_id = template_id if template_id != "custom" else f"agent_{i}"
+            if template_id == "qa_notes":
+                default_actor_id = "qa_notes"
             while True:
                 actor_id = _prompt_line(f"Actor id for stage {i}", default=default_actor_id)
                 actor_id = actor_id.strip()
@@ -800,6 +857,12 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                 if actor_id in used_actor_ids:
                     print("Actor id must be unique.")
                     continue
+                if template_id == "qa_notes" and actor_id != "qa_notes":
+                    print("WARN: qa_notes stage requires actor_id 'qa_notes'; using 'qa_notes'.")
+                    actor_id = "qa_notes"
+                    if actor_id in used_actor_ids:
+                        print("Actor id must be unique.")
+                        continue
                 used_actor_ids.add(actor_id)
                 break
 
@@ -849,56 +912,113 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                     return_from=return_from,
                 )
 
+    def _is_tester_template(template_id: str) -> bool:
+        return template_id in {"tester", "manual_tester", "auto_tester"}
+
+    # Optional: insert a QA notes stage that produces QA_NOTES.md (per task).
+    has_tester = any(_is_tester_template(a.template_id) for a in agents)
+    has_coder = any(a.template_id == "coder" for a in agents)
+    has_qa_notes = any(a.actor_id == "qa_notes" for a in agents)
+    if not has_qa_notes:
+        insert_qa = _prompt_yes_no(
+            "Insert QA notes stage (qa_notes)?",
+            default=(has_tester and has_coder),
+        )
+        if insert_qa:
+            tester_indexes = [i for i, a in enumerate(agents) if _is_tester_template(a.template_id)]
+            if tester_indexes:
+                first_tester_i = min(tester_indexes)
+                last_reviewer_i: int | None = None
+                for i in range(0, first_tester_i):
+                    if agents[i].template_id == "reviewer":
+                        last_reviewer_i = i
+                insert_at = (last_reviewer_i + 1) if last_reviewer_i is not None else first_tester_i
+            else:
+                last_coder_i: int | None = None
+                for i, a in enumerate(agents):
+                    if a.template_id == "coder":
+                        last_coder_i = i
+                insert_at = (last_coder_i + 1) if last_coder_i is not None else len(agents)
+            agents.insert(insert_at, AgentSpec(actor_id="qa_notes", template_id="qa_notes"))
+
+    # If any tester exists, capture explicit testing expectations and append to task details.
+    has_tester = any(_is_tester_template(a.template_id) for a in agents)
+    if has_tester:
+        print("")
+        print("Testing expectations hint (optional): DoD, scope, constraints, environments, what to automate.")
+        testing = _prompt_multiline_optional("Testing expectations")
+        if testing.strip():
+            task = TaskConfig(
+                kind=task.kind,
+                details_md=_append_md_section(
+                    task.details_md, heading="Testing expectations", body=testing
+                ),
+            )
+        print("")
+
     # Optional: configure how the orchestrator reacts to reviewer findings.
     if orchestration is not None:
-        reviewer_actor_ids = [a.actor_id for a in agents if a.template_id == "reviewer"]
-        if reviewer_actor_ids:
-            reviewer_actor_id = reviewer_actor_ids[0]
-            mode = _prompt_choice(
-                "Review reaction (status_failed/any_tag/only_minor/majors_leq_n/escalate)",
-                choices=["status_failed", "any_tag", "only_minor", "majors_leq_n", "escalate"],
-                default="status_failed",
-            )
-            policy: ReviewReactionPolicy | None = None
-            if mode == "any_tag":
-                policy = ReviewReactionPolicy(actor_id=reviewer_actor_id, trigger="any_tag")
-            elif mode == "only_minor":
-                policy = ReviewReactionPolicy(
-                    actor_id=reviewer_actor_id,
-                    trigger="any_tag",
-                    max_severity="MINOR",
-                    on_trigger="return",
-                    on_overflow="escalate",
-                )
-            elif mode == "majors_leq_n":
-                n = _prompt_int(
-                    "Max MAJOR findings to return (exceed => escalate)",
-                    min_value=0,
-                    max_value=20,
-                    default=3,
-                )
-                policy = ReviewReactionPolicy(
-                    actor_id=reviewer_actor_id,
-                    trigger="any_tag",
-                    max_majors=n,
-                    on_trigger="return",
-                    on_overflow="escalate",
-                )
-            elif mode == "escalate":
-                policy = ReviewReactionPolicy(
-                    actor_id=reviewer_actor_id,
-                    trigger="status_failed",
-                    on_trigger="escalate",
-                    on_overflow="escalate",
-                )
+        relevant_actor_ids = [
+            a.actor_id
+            for a in agents
+            if a.template_id in {"reviewer", "manual_tester", "tester"}
+        ]
+        if relevant_actor_ids:
+            existing: dict[str, ReviewReactionPolicy] = {
+                p.actor_id: p for p in orchestration.review_policies
+            }
 
-            if policy is not None:
+            for actor_id in relevant_actor_ids:
+                mode = _prompt_choice(
+                    f"Reaction policy for {actor_id} (status_failed/any_tag/only_minor/majors_leq_n/escalate)",
+                    choices=["status_failed", "any_tag", "only_minor", "majors_leq_n", "escalate"],
+                    default="status_failed",
+                )
+                policy: ReviewReactionPolicy | None = None
+                if mode == "status_failed":
+                    existing.pop(actor_id, None)
+                elif mode == "any_tag":
+                    policy = ReviewReactionPolicy(actor_id=actor_id, trigger="any_tag")
+                elif mode == "only_minor":
+                    policy = ReviewReactionPolicy(
+                        actor_id=actor_id,
+                        trigger="any_tag",
+                        max_severity="MINOR",
+                        on_trigger="return",
+                        on_overflow="escalate",
+                    )
+                elif mode == "majors_leq_n":
+                    n = _prompt_int(
+                        "Max MAJOR findings to return (exceed => escalate)",
+                        min_value=0,
+                        max_value=20,
+                        default=3,
+                    )
+                    policy = ReviewReactionPolicy(
+                        actor_id=actor_id,
+                        trigger="any_tag",
+                        max_majors=n,
+                        on_trigger="return",
+                        on_overflow="escalate",
+                    )
+                elif mode == "escalate":
+                    policy = ReviewReactionPolicy(
+                        actor_id=actor_id,
+                        trigger="status_failed",
+                        on_trigger="escalate",
+                        on_overflow="escalate",
+                    )
+
+                if policy is not None:
+                    existing[actor_id] = policy
+
+            if existing:
                 orchestration = OrchestrationConfig(
                     preset=orchestration.preset,
                     max_returns=orchestration.max_returns,
                     return_to=orchestration.return_to,
                     return_from=orchestration.return_from,
-                    review_policies=(policy,),
+                    review_policies=tuple(existing[k] for k in sorted(existing.keys())),
                 )
 
     interaction_notes = _prompt_multiline_optional("Workflow/interaction notes")
@@ -1118,6 +1238,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
 
         base_docs = _base_packet_docs(
             workspace_dir=workspace_dir,
+            task_orchestrator_dir=orch_dir,
             goal=goal,
             task=task,
             agent=agent,
