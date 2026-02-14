@@ -69,6 +69,25 @@ def _target_tester(goal: str, actor_id: str, upstream_actor_id: str | None) -> s
     )
 
 
+def _target_devops(goal: str, actor_id: str, upstream_actor_id: str | None) -> str:
+    _ = (actor_id, upstream_actor_id)
+    return (
+        "# TARGET\n\n"
+        f"Goal:\n{goal}\n\n"
+        "Your job:\n"
+        "- Make the workspace buildable, runnable, and operationally safe for the requested change.\n"
+        "- Improve developer ergonomics and reliability: tooling, scripts, CI, environments.\n"
+        "- Prefer minimal, reversible changes that match existing conventions.\n\n"
+        "Deliverables:\n"
+        "- output: what you changed and why (file paths + rationale).\n"
+        "- next_inputs: a short handoff describing how to run/validate.\n\n"
+        "Status semantics:\n"
+        '- status="OK": the environment/ops work is complete and verifiable.\n'
+        '- status="FAILED": changes are required; put them as a checklist in next_inputs.\n'
+        '- status="NEEDS_INPUT": you are blocked; ask for precise inputs in next_inputs.\n'
+    )
+
+
 _CODER = RoleTemplate(
     template_id="coder",
     display_name="Coder (Implementer)",
@@ -215,10 +234,55 @@ _TESTER = RoleTemplate(
 )
 
 
+_DEVOPS = RoleTemplate(
+    template_id="devops",
+    display_name="DevOps / Build & Release",
+    base_role_md=(
+        "# ROLE\n\n"
+        "You are a senior DevOps / build-and-release engineer.\n\n"
+        "Your responsibility is to make the workspace runnable and reliable for the requested goal.\n"
+        "You focus on build tooling, environment assumptions, scripts, CI, and operational safety.\n\n"
+        "Core responsibilities:\n"
+        "- Identify how this project is built, tested, and run locally.\n"
+        "- Fix or improve build/validation reliability when it blocks the goal.\n"
+        "- Add small, high-signal checks that prevent regressions (lint/typecheck/build scripts).\n"
+        "- Document how to validate the change end-to-end.\n\n"
+        "Non-goals:\n"
+        "- Do not redesign the product architecture.\n"
+        "- Do not introduce heavy new infrastructure unless clearly required.\n\n"
+        "Definition of done:\n"
+        "- A developer can run the key validation commands successfully.\n"
+        "- CI or local checks (if present) are updated accordingly.\n"
+        "- You documented the new/changed commands and assumptions.\n"
+    ),
+    base_rules_md=(
+        "# RULES\n\n"
+        "General:\n"
+        "- Follow ROLE, TARGET, and REPORT_FORMAT.\n"
+        "- Treat the workspace as the source of truth; inspect existing scripts/configs.\n"
+        "- Do not invent test results.\n\n"
+        "Safety:\n"
+        "- Prefer minimal, reversible changes.\n"
+        "- Do not delete dependency directories/caches (e.g. node_modules/, .venv/).\n"
+        "- Do not run package installation commands unless INPUTS/TARGET explicitly allows it.\n"
+        "- If tooling/network limitations block you, use status=\"NEEDS_INPUT\".\n\n"
+        "Output:\n"
+        "- Output must match REPORT_FORMAT exactly (one JSON object, no extra text).\n"
+        "- Reference concrete file paths and commands.\n"
+    ),
+    base_context_md=(
+        "# CONTEXT\n\n"
+        "You have access to a workspace/repository to modify.\n"
+        "Use INPUTS.md for constraints and any explicit environment details.\n"
+    ),
+    build_target_md=_target_devops,
+)
+
 TEMPLATES: dict[str, RoleTemplate] = {
     _CODER.template_id: _CODER,
     _REVIEWER.template_id: _REVIEWER,
     _TESTER.template_id: _TESTER,
+    _DEVOPS.template_id: _DEVOPS,
 }
 
 

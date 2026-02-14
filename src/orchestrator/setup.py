@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +13,8 @@ from pathlib import Path
 from src.core.packet import write_packet_documents
 from src.core.runtime import (
     ActorConfig,
+    DeliveryConfig,
+    GitDefaultsConfig,
     OrchestrationConfig,
     PipelineConfig,
     ProviderConfig,
@@ -21,6 +25,8 @@ from src.core.runtime import (
 )
 from src.core.types import JsonDict
 from src.orchestrator.templates import get_template, list_template_ids
+from src.orchestrator.spec import AgentSpec
+from src.orchestrator.wizard import run_setup_wizard_analyze, run_setup_wizard_write_packet
 from src.providers.base import Provider
 from src.providers.codex_cli import CodexCLIProvider
 from src.providers.deterministic import DeterministicProvider
@@ -208,14 +214,6 @@ def _extract_first_json_object(text: str) -> JsonDict | None:
     return None
 
 
-@dataclass(frozen=True)
-class AgentSpec:
-    actor_id: str
-    template_id: str  # coder/reviewer/tester/custom
-    specialization: str
-    custom_role: str
-
-
 def _task_kind_title(kind: TaskKind) -> str:
     if kind == "feature":
         return "Feature implementation"
@@ -223,6 +221,8 @@ def _task_kind_title(kind: TaskKind) -> str:
         return "Bug fix"
     if kind == "bootstrap":
         return "Bootstrap / greenfield"
+    if kind == "other":
+        return "Other"
     return kind
 
 
@@ -569,8 +569,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     print("")
 
     task_kind = _prompt_choice(
-        "Task type (feature/bug/bootstrap)",
-        choices=["feature", "bug", "bootstrap"],
+        "Task type (feature/bug/bootstrap/other)",
+        choices=["feature", "bug", "bootstrap", "other"],
         default="feature",
     )
     goal_label = "What is the goal of orchestration?"
@@ -580,6 +580,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         goal_label = "What bug do you want to fix?"
     elif task_kind == "bootstrap":
         goal_label = "What do you want to build from scratch?"
+    elif task_kind == "other":
+        goal_label = "What do you want to do?"
     goal = _prompt_line(goal_label)
 
     print("")
@@ -587,18 +589,44 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         print("Task details hint (optional): acceptance criteria, constraints, rollout/compat notes.")
     elif task_kind == "bug":
         print("Task details hint (optional): repro steps, expected vs actual, scope constraints.")
-    else:
+    elif task_kind == "bootstrap":
         print("Task details hint (optional): requirements, non-goals, constraints, acceptance criteria.")
+    else:
+        print("Task details hint (optional): constraints, acceptance criteria, non-goals, risks.")
     details = _prompt_multiline_optional("Task details")
     task = TaskConfig(kind=task_kind, details_md=details)
     print("")
 
+    if task_kind == "bootstrap" and not (workspace_dir / ".git").exists():
+        init_git = _prompt_yes_no(
+            "Workspace is not a git repository. Initialize git here (git init)?",
+            default=True,
+        )
+        if init_git:
+            p = subprocess.run(
+                ["git", "init"],
+                cwd=str(workspace_dir),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if p.returncode != 0:
+                out = (p.stdout or "").strip()
+                print(f"WARN: git init failed (exit={p.returncode}): {out}")
+            else:
+                print("git: initialized repository")
+                print("")
+
     preset = _prompt_choice(
-        "Orchestration preset (crt/cr/custom)",
-        choices=["crt", "cr", "custom"],
+        "Workflow preset (crt/cr/c/r/t/d/custom)",
+        choices=["crt", "cr", "c", "r", "t", "d", "custom"],
         default="crt",
     )
-    max_returns = 3
+
+    # Choose templates and specializations.
+    agents: list[AgentSpec] = []
+    orchestration: OrchestrationConfig | None = None
+
     if preset == "crt":
         max_returns = _prompt_int(
             "Max returns (review/test -> coder)",
@@ -606,7 +634,22 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             max_value=10,
             default=3,
         )
-        num_agents = 3
+        for template_id in ("coder", "reviewer", "tester"):
+            specialization = _prompt_optional_line(f"Specialization for {template_id} (optional)")
+            agents.append(
+                AgentSpec(
+                    actor_id=template_id,
+                    template_id=template_id,
+                    specialization=specialization,
+                )
+            )
+        orchestration = OrchestrationConfig(
+            preset="linear_v1",
+            max_returns=max_returns,
+            return_to="coder",
+            return_from=("reviewer", "tester"),
+        )
+
     elif preset == "cr":
         max_returns = _prompt_int(
             "Max returns (review -> coder)",
@@ -614,11 +657,113 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             max_value=10,
             default=3,
         )
-        num_agents = 2
-    else:
-        num_agents = _prompt_int(
-            "How many agents do you want? (2-4)", min_value=2, max_value=4, default=2
+        for template_id in ("coder", "reviewer"):
+            specialization = _prompt_optional_line(f"Specialization for {template_id} (optional)")
+            agents.append(
+                AgentSpec(
+                    actor_id=template_id,
+                    template_id=template_id,
+                    specialization=specialization,
+                )
+            )
+        orchestration = OrchestrationConfig(
+            preset="linear_v1",
+            max_returns=max_returns,
+            return_to="coder",
+            return_from=("reviewer",),
         )
+
+    elif preset == "c":
+        specialization = _prompt_optional_line("Specialization for coder (optional)")
+        agents.append(AgentSpec(actor_id="coder", template_id="coder", specialization=specialization))
+
+    elif preset == "r":
+        specialization = _prompt_optional_line("Specialization for reviewer (optional)")
+        agents.append(
+            AgentSpec(actor_id="reviewer", template_id="reviewer", specialization=specialization)
+        )
+
+    elif preset == "t":
+        specialization = _prompt_optional_line("Specialization for tester (optional)")
+        agents.append(AgentSpec(actor_id="tester", template_id="tester", specialization=specialization))
+
+    elif preset == "d":
+        specialization = _prompt_optional_line("Specialization for devops (optional)")
+        agents.append(
+            AgentSpec(actor_id="devops", template_id="devops", specialization=specialization)
+        )
+
+    else:
+        stage_count = _prompt_int(
+            "How many stages do you want? (1-6)",
+            min_value=1,
+            max_value=6,
+            default=2,
+        )
+        template_ids = list_template_ids() + ["custom"]
+        used_actor_ids: set[str] = set()
+
+        for i in range(1, stage_count + 1):
+            template_id = _prompt_choice(
+                f"Template for stage {i} ({'/'.join(template_ids)})",
+                choices=template_ids,
+                default=("coder" if i == 1 else "reviewer"),
+            )
+
+            default_actor_id = template_id if template_id != "custom" else f"agent_{i}"
+            while True:
+                actor_id = _prompt_line(f"Actor id for stage {i}", default=default_actor_id)
+                actor_id = actor_id.strip()
+                if not actor_id:
+                    continue
+                if any(ch.isspace() for ch in actor_id):
+                    print("Actor id must not contain whitespace.")
+                    continue
+                if actor_id in used_actor_ids:
+                    print("Actor id must be unique.")
+                    continue
+                used_actor_ids.add(actor_id)
+                break
+
+            if template_id == "custom":
+                role = _prompt_line(f"Role for {actor_id}")
+                agents.append(AgentSpec(actor_id=actor_id, template_id="custom", custom_role=role))
+            else:
+                specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
+                agents.append(
+                    AgentSpec(
+                        actor_id=actor_id,
+                        template_id=template_id,
+                        specialization=specialization,
+                    )
+                )
+
+        if stage_count >= 2:
+            enable_returns = _prompt_yes_no("Enable return-on-failure loop?", default=True)
+            if enable_returns:
+                max_returns = _prompt_int(
+                    "Max returns (FAILED -> return_to)",
+                    min_value=0,
+                    max_value=10,
+                    default=3,
+                )
+                default_return_to = "coder" if any(a.actor_id == "coder" for a in agents) else agents[0].actor_id
+                return_to = _prompt_line("Return to actor_id", default=default_return_to).strip()
+                if return_to not in {a.actor_id for a in agents}:
+                    print("WARN: return_to is not a valid actor_id; using first stage actor_id.")
+                    return_to = agents[0].actor_id
+                default_from = ",".join(a.actor_id for a in agents if a.actor_id != return_to)
+                raw_from = _prompt_line("Return from actor_ids (comma separated)", default=default_from)
+                return_from = tuple(x.strip() for x in raw_from.split(",") if x.strip())
+                return_from = tuple(x for x in return_from if x != return_to)
+                orchestration = OrchestrationConfig(
+                    preset="linear_v1",
+                    max_returns=max_returns,
+                    return_to=return_to,
+                    return_from=return_from,
+                )
+
+    interaction_notes = _prompt_multiline_optional("Workflow/interaction notes")
 
     use_codex = _prompt_yes_no("Do you want Codex CLI as provider?", default=False)
     if use_codex:
@@ -655,79 +800,48 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         idle_timeout_s=idle_timeout_s,
     )
 
-    refine_now = False
-    if provider_cfg.type == "codex_cli":
-        refine_now = _prompt_yes_no("Use provider to refine packet documents now?", default=True)
-
-    # Choose templates and specializations.
-    agents: list[AgentSpec] = []
-    if preset == "crt":
-        for template_id in ("coder", "reviewer", "tester"):
-            actor_id = template_id
-            specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
-            agents.append(
-                AgentSpec(
-                    actor_id=actor_id,
-                    template_id=template_id,
-                    specialization=specialization,
-                    custom_role="",
-                )
-            )
-    elif preset == "cr":
-        for template_id in ("coder", "reviewer"):
-            actor_id = template_id
-            specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
-            agents.append(
-                AgentSpec(
-                    actor_id=actor_id,
-                    template_id=template_id,
-                    specialization=specialization,
-                    custom_role="",
-                )
-            )
+    default_git_mode = "off"
+    if (workspace_dir / ".git").exists():
+        default_git_mode = "branch"
+    git_mode = _prompt_choice(
+        "Default git safety for runs (branch/check/off)",
+        choices=["branch", "check", "off"],
+        default=default_git_mode,
+    )
+    git_defaults: GitDefaultsConfig | None = None
+    branch_pref = ""
+    commit_pref = ""
+    if git_mode == "off":
+        git_defaults = GitDefaultsConfig(mode="off")
     else:
-        template_ids = list_template_ids() + ["custom"]
-        for i in range(1, num_agents + 1):
-            actor_id = f"agent_{i}"
-            default_template = "custom"
-            if i == 1:
-                default_template = "coder"
-            elif i == 2:
-                default_template = "reviewer"
-            elif i == 3:
-                default_template = "tester"
+        branch_prefix = _prompt_line("Git branch prefix", default="orch/")
+        auto_commit = _prompt_yes_no("Auto-commit after implementer steps?", default=True)
+        branch_pref = _prompt_optional_line(
+            "Branch naming preference (optional, e.g. 'JIRA-123/feat-{slug}')"
+        )
+        commit_pref = _prompt_optional_line(
+            "Commit message preference (optional, e.g. 'conventional commits')"
+        )
+        git_defaults = GitDefaultsConfig(
+            mode=git_mode, branch_prefix=branch_prefix, auto_commit=auto_commit
+        )
 
-            template_id = _prompt_choice(
-                f"Template for {actor_id} ({'/'.join(template_ids)})",
-                choices=template_ids,
-                default=default_template,
-            )
-            if template_id == "custom":
-                role = _prompt_line(f"Role for {actor_id}")
-                agents.append(
-                    AgentSpec(
-                        actor_id=actor_id,
-                        template_id="custom",
-                        specialization="",
-                        custom_role=role,
-                    )
-                )
-            else:
-                specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
-                agents.append(
-                    AgentSpec(
-                        actor_id=actor_id,
-                        template_id=template_id,
-                        specialization=specialization,
-                        custom_role="",
-                    )
-                )
+    mr_mode = _prompt_choice(
+        "Merge request at end (off/instructions)",
+        choices=["off", "instructions"],
+        default="off",
+    )
+    delivery: DeliveryConfig | None = None
+    if mr_mode == "instructions":
+        remote = _prompt_line("MR remote", default="origin")
+        target_branch = _prompt_line("MR target branch", default="main")
+        delivery = DeliveryConfig(mr_mode="instructions", remote=remote, target_branch=target_branch)
 
     # Create base directories deterministically.
     runs_dir.mkdir(parents=True, exist_ok=True)
     packets_dir.mkdir(parents=True, exist_ok=True)
 
-    # Provider instance for optional refinement.
+    # Provider instance for wizarding/refinement.
     provider: Provider
     if provider_cfg.type == "codex_cli":
         assert provider_cfg.command is not None
@@ -735,7 +849,17 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
     else:
         provider = DeterministicProvider()
 
+    run_wizard = False
+    wizard_parallel = False
+    if provider_cfg.type == "codex_cli":
+        run_wizard = _prompt_yes_no("Run setup wizard (AI) now?", default=True)
+        if run_wizard:
+            wizard_parallel = _prompt_yes_no(
+                "Wizard: generate per-agent packets in parallel?", default=True
+            )
+
     actor_cfgs: list[ActorConfig] = []
+    docs_by_actor: dict[str, dict[str, str]] = {}
     for i, agent in enumerate(agents, start=1):
         actor_cfgs.append(
             ActorConfig(
@@ -745,7 +869,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             )
         )
 
-        docs = _base_packet_docs(
+        base_docs = _base_packet_docs(
             workspace_dir=workspace_dir,
             goal=goal,
             task=task,
@@ -753,47 +877,120 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             is_first=i == 1,
         )
 
-        if refine_now and provider_cfg.type == "codex_cli":
-            gen_dir = orch_dir / "setup_artifacts" / agent.actor_id
-            gen_dir.mkdir(parents=True, exist_ok=True)
-            ui = _SetupRefineUI(label=f"refine:{agent.actor_id}")
-            refined, meta = _refine_packet_docs_via_provider(
-                provider,
-                artifacts_dir=gen_dir,
-                goal=goal,
-                task=task,
-                agent=agent,
-                base_role_md=docs["ROLE"],
-                base_target_md=docs["TARGET"],
-                base_rules_md=docs["RULES"],
-                base_context_md=docs["CONTEXT"],
-                timeout_s=provider_cfg.timeout_s,
-                idle_timeout_s=provider_cfg.idle_timeout_s,
-                on_event=ui.on_event,
-            )
-            ui.finish()
-            if refined is not None:
-                docs.update(refined)
+        docs_by_actor[agent.actor_id] = base_docs
+
+    brief_md = ""
+    if run_wizard:
+        notes = interaction_notes.strip()
+        if branch_pref.strip():
+            notes = (notes + "\n\n" if notes else "") + f"Branch naming preference: {branch_pref.strip()}\n"
+        if commit_pref.strip():
+            notes = (notes + "\n\n" if notes else "") + f"Commit message preference: {commit_pref.strip()}\n"
+
+        wiz_dir = orch_dir / "setup_artifacts" / "_wizard"
+        wiz_dir.mkdir(parents=True, exist_ok=True)
+        ui = _SetupRefineUI(label="wizard:analyze")
+        wiz, meta = run_setup_wizard_analyze(
+            provider,
+            workspace_dir=workspace_dir,
+            goal=goal,
+            task=task,
+            agents=tuple(agents),
+            orchestration=orchestration,
+            git_defaults=git_defaults,
+            delivery=delivery,
+            interaction_notes=notes,
+            artifacts_dir=wiz_dir,
+            timeout_s=provider_cfg.timeout_s,
+            idle_timeout_s=provider_cfg.idle_timeout_s,
+            on_event=ui.on_event,
+        )
+        ui.finish()
+        if wiz is None:
+            timed_out = bool(meta.get("timed_out"))
+            idle_timed_out = bool(meta.get("idle_timed_out"))
+            hint = ""
+            if timed_out or idle_timed_out:
+                hint = f" (timed_out={timed_out}, idle_timed_out={idle_timed_out})"
+            print(f"WARN: setup wizard analyze failed; using base templates.{hint}")
+            print(f"WARN: see artifacts in {wiz_dir}")
+        else:
+            brief_md = wiz.brief_md
+            (orch_dir / "BRIEF.md").write_text(brief_md, encoding="utf-8")
+            if wiz.git is not None:
+                git_defaults = wiz.git
+            if wiz.delivery is not None:
+                delivery = wiz.delivery
+            if wiz.orchestration is not None:
+                orchestration = wiz.orchestration
+
+            def _refine_one(agent: AgentSpec) -> tuple[str, dict[str, str] | None, JsonDict]:
+                gen_dir = orch_dir / "setup_artifacts" / f"wizard_{agent.actor_id}"
+                gen_dir.mkdir(parents=True, exist_ok=True)
+                refined, meta2 = run_setup_wizard_write_packet(
+                    provider,
+                    goal=goal,
+                    task=task,
+                    agent=agent,
+                    brief_md=brief_md,
+                    base_docs=docs_by_actor[agent.actor_id],
+                    artifacts_dir=gen_dir,
+                    timeout_s=provider_cfg.timeout_s,
+                    idle_timeout_s=provider_cfg.idle_timeout_s,
+                    on_event=None,
+                )
+                if refined is None:
+                    return agent.actor_id, None, meta2
+                return agent.actor_id, refined.docs, meta2
+
+            results: dict[str, dict[str, str]] = {}
+            failures: dict[str, JsonDict] = {}
+            if wizard_parallel and len(agents) > 1:
+                with ThreadPoolExecutor(max_workers=min(4, len(agents))) as ex:
+                    futs = [ex.submit(_refine_one, a) for a in agents]
+                    for fut in as_completed(futs):
+                        actor_id, refined_docs, meta2 = fut.result()
+                        if refined_docs is None:
+                            failures[actor_id] = meta2
+                        else:
+                            results[actor_id] = refined_docs
             else:
-                timed_out = bool(meta.get("timed_out"))
-                idle_timed_out = bool(meta.get("idle_timed_out"))
+                for a in agents:
+                    ui2 = _SetupRefineUI(label=f"wizard:packet:{a.actor_id}")
+                    refined, meta2 = run_setup_wizard_write_packet(
+                        provider,
+                        goal=goal,
+                        task=task,
+                        agent=a,
+                        brief_md=brief_md,
+                        base_docs=docs_by_actor[a.actor_id],
+                        artifacts_dir=(orch_dir / "setup_artifacts" / f"wizard_{a.actor_id}"),
+                        timeout_s=provider_cfg.timeout_s,
+                        idle_timeout_s=provider_cfg.idle_timeout_s,
+                        on_event=ui2.on_event,
+                    )
+                    ui2.finish()
+                    if refined is None:
+                        failures[a.actor_id] = meta2
+                    else:
+                        results[a.actor_id] = refined.docs
+
+            for actor_id, refined_docs in results.items():
+                docs_by_actor[actor_id].update(refined_docs)
+
+            for actor_id, meta2 in failures.items():
+                timed_out = bool(meta2.get("timed_out"))
+                idle_timed_out = bool(meta2.get("idle_timed_out"))
                 hint = ""
                 if timed_out or idle_timed_out:
                     hint = f" (timed_out={timed_out}, idle_timed_out={idle_timed_out})"
-                print(
-                    "WARN: provider refinement failed for "
-                    f"{agent.actor_id}; using base templates.{hint}"
-                )
-                print(f"WARN: see artifacts in {gen_dir}")
+                print(f"WARN: setup wizard packet failed for {actor_id}; using base templates.{hint}")
+                print(f"WARN: see artifacts in {orch_dir / 'setup_artifacts' / f'wizard_{actor_id}'}")
 
+    for agent in agents:
         packet_dir = packets_dir / agent.actor_id
-        write_packet_documents(packet_dir, docs=docs)
+        write_packet_documents(packet_dir, docs=docs_by_actor[agent.actor_id])
 
-    orchestration = None
-    if preset == "crt":
-        orchestration = OrchestrationConfig(preset="crt_v1", max_returns=max_returns)
-    elif preset == "cr":
-        orchestration = OrchestrationConfig(preset="cr_v1", max_returns=max_returns)
     pipeline = PipelineConfig(
         version=1,
         provider=provider_cfg,
@@ -801,6 +998,8 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
         orchestration=orchestration,
         goal=goal,
         task=task,
+        git_defaults=git_defaults,
+        delivery=delivery,
     )
     save_pipeline(pipeline_path, pipeline)
 
