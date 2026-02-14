@@ -232,6 +232,7 @@ def run_setup_wizard_analyze(
                 max_returns=next_max,
                 return_to=next_return_to,
                 return_from=next_return_from,
+                review_policies=orchestration.review_policies,
             )
         except Exception:
             out_orch = orchestration
@@ -286,6 +287,9 @@ def run_setup_wizard_write_packet(
             "- Do not output markdown fences.\n",
             "- Keep rules language-agnostic.\n",
             "- Do not suggest destructive workspace commands (no rm -rf, no installs).\n\n",
+            "Preservation:\n",
+            "- Preserve any explicit protocols from the base docs (output structure requirements, checklists).\n",
+            "- Expand and clarify, but do not weaken requirements such as severity taxonomy or checklist rules.\n\n",
             "Quality bar:\n",
             "- Make this substantially more detailed than the base templates.\n",
             "- Make the step executable: include a concrete investigation/implementation/validation approach.\n\n",

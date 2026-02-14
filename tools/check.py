@@ -268,7 +268,19 @@ def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
             {"actor_id": "reviewer", "packet_dir": "reviewer", "include_paths_in_prompt": True},
             {"actor_id": "tester", "packet_dir": "tester", "include_paths_in_prompt": True},
         ],
-        "orchestration": {"preset": "crt_v1", "max_returns": 3},
+        "orchestration": {
+            "preset": "crt_v1",
+            "max_returns": 3,
+            "review_policies": [
+                {
+                    "actor_id": "reviewer",
+                    "trigger": "any_tag",
+                    "max_majors": 3,
+                    "on_trigger": "return",
+                    "on_overflow": "escalate",
+                }
+            ],
+        },
     }
     try:
         pipeline = PipelineConfig.from_dict(raw)
@@ -289,6 +301,15 @@ def _check_pipeline_orchestration_parsing(root: Path) -> list[Issue]:
                 line=None,
                 code="PIPE002",
                 message=f"Unexpected orchestration parsed: {orch!r}",
+            )
+        ]
+    if not orch.review_policies or orch.review_policies[0].actor_id != "reviewer":
+        return [
+            Issue(
+                path=root / "src" / "core" / "runtime.py",
+                line=None,
+                code="PIPE003",
+                message=f"Expected review_policies to parse, got: {orch.review_policies!r}",
             )
         ]
     return []

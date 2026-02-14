@@ -12,6 +12,96 @@ from src.core.types import JsonDict
 ProviderType = Literal["deterministic", "codex_cli", "gemini_cli", "claude_cli"]
 PresetType = Literal["crt_v1", "cr_v1", "linear_v1"]
 TaskKind = Literal["feature", "bug", "bootstrap", "other"]
+SeverityTag = Literal["BLOCKER", "MAJOR", "MINOR", "NIT"]
+ReviewTrigger = Literal["status_failed", "any_tag"]
+ReviewAction = Literal["return", "escalate"]
+
+
+@dataclass(frozen=True)
+class ReviewReactionPolicy:
+    """
+    Optional orchestration rule for reacting to a specific actor's review output.
+
+    This is intended for "reviewer"-like steps that produce findings tagged with:
+        [BLOCKER], [MAJOR], [MINOR], [NIT]
+    The orchestrator can use this to decide whether to return to an implementer
+    (return_to) or escalate for human input.
+    """
+
+    actor_id: str
+    trigger: ReviewTrigger = "status_failed"
+    min_severity: SeverityTag | None = None
+    max_severity: SeverityTag | None = None
+    max_blockers: int | None = None
+    max_majors: int | None = None
+    max_total: int | None = None
+    on_trigger: ReviewAction = "return"
+    on_overflow: ReviewAction = "escalate"
+
+    def to_dict(self) -> JsonDict:
+        d: JsonDict = {
+            "actor_id": self.actor_id,
+            "trigger": self.trigger,
+            "on_trigger": self.on_trigger,
+            "on_overflow": self.on_overflow,
+        }
+        if self.min_severity is not None:
+            d["min_severity"] = self.min_severity
+        if self.max_severity is not None:
+            d["max_severity"] = self.max_severity
+        if self.max_blockers is not None:
+            d["max_blockers"] = self.max_blockers
+        if self.max_majors is not None:
+            d["max_majors"] = self.max_majors
+        if self.max_total is not None:
+            d["max_total"] = self.max_total
+        return d
+
+    @staticmethod
+    def from_dict(obj: dict[str, Any]) -> "ReviewReactionPolicy":
+        actor_id = obj.get("actor_id")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            raise ValueError("review_policy.actor_id must be a non-empty string")
+        trigger = obj.get("trigger", "status_failed")
+        if trigger not in ("status_failed", "any_tag"):
+            raise ValueError("review_policy.trigger must be 'status_failed' or 'any_tag'")
+        on_trigger = obj.get("on_trigger", "return")
+        if on_trigger not in ("return", "escalate"):
+            raise ValueError("review_policy.on_trigger must be 'return' or 'escalate'")
+        on_overflow = obj.get("on_overflow", "escalate")
+        if on_overflow not in ("return", "escalate"):
+            raise ValueError("review_policy.on_overflow must be 'return' or 'escalate'")
+
+        min_sev = obj.get("min_severity")
+        if min_sev is not None and min_sev not in ("BLOCKER", "MAJOR", "MINOR", "NIT"):
+            raise ValueError("review_policy.min_severity must be one of BLOCKER/MAJOR/MINOR/NIT")
+        max_sev = obj.get("max_severity")
+        if max_sev is not None and max_sev not in ("BLOCKER", "MAJOR", "MINOR", "NIT"):
+            raise ValueError("review_policy.max_severity must be one of BLOCKER/MAJOR/MINOR/NIT")
+
+        def _opt_int(name: str) -> int | None:
+            raw = obj.get(name)
+            if raw is None:
+                return None
+            try:
+                v = int(raw)
+            except Exception as e:
+                raise ValueError(f"review_policy.{name} must be an int") from e
+            if v < 0:
+                raise ValueError(f"review_policy.{name} must be >= 0")
+            return v
+
+        return ReviewReactionPolicy(
+            actor_id=actor_id.strip(),
+            trigger=trigger,
+            min_severity=min_sev,
+            max_severity=max_sev,
+            max_blockers=_opt_int("max_blockers"),
+            max_majors=_opt_int("max_majors"),
+            max_total=_opt_int("max_total"),
+            on_trigger=on_trigger,
+            on_overflow=on_overflow,
+        )
 
 
 def orchestrator_root(workspace_dir: Path) -> Path:
@@ -126,6 +216,7 @@ class OrchestrationConfig:
     max_returns: int = 3
     return_to: str | None = None
     return_from: tuple[str, ...] = ()
+    review_policies: tuple[ReviewReactionPolicy, ...] = ()
 
     def to_dict(self) -> JsonDict:
         d: JsonDict = {"preset": self.preset, "max_returns": self.max_returns}
@@ -133,6 +224,8 @@ class OrchestrationConfig:
             d["return_to"] = self.return_to
         if self.return_from:
             d["return_from"] = list(self.return_from)
+        if self.review_policies:
+            d["review_policies"] = [p.to_dict() for p in self.review_policies]
         return d
 
     @staticmethod
@@ -174,6 +267,22 @@ class OrchestrationConfig:
                 raise ValueError("orchestration.return_from must be a list of strings")
             return_from = tuple(x.strip() for x in return_from_raw)
 
+        review_raw = obj.get("review_policies")
+        review_policies: tuple[ReviewReactionPolicy, ...] = ()
+        if review_raw is not None:
+            if not isinstance(review_raw, list) or not all(isinstance(x, dict) for x in review_raw):
+                raise ValueError("orchestration.review_policies must be a list of objects")
+            parsed = [ReviewReactionPolicy.from_dict(x) for x in review_raw]
+            seen: set[str] = set()
+            for p in parsed:
+                if p.actor_id in seen:
+                    raise ValueError(
+                        "orchestration.review_policies actor_id must be unique; "
+                        f"duplicate: {p.actor_id!r}"
+                    )
+                seen.add(p.actor_id)
+            review_policies = tuple(parsed)
+
         # Preset defaults (backwards-compatible).
         if preset == "crt_v1":
             if return_to is None:
@@ -191,6 +300,7 @@ class OrchestrationConfig:
             max_returns=max_returns,
             return_to=return_to,
             return_from=return_from,
+            review_policies=review_policies,
         )
 
 

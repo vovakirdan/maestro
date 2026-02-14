@@ -16,6 +16,7 @@ from src.core.runtime import (
     ActorConfig,
     PipelineConfig,
     ProviderConfig,
+    ReviewReactionPolicy,
     generate_run_id,
     load_pipeline,
     orchestrator_root,
@@ -71,6 +72,94 @@ def _format_template(template: str, *, values: JsonDict) -> str:
         return template.format(**values)
     except Exception:
         return template
+
+
+_RE_SEVERITY_TAG = re.compile(r"\\[(BLOCKER|MAJOR|MINOR|NIT)\\]")
+_SEV_RANK: dict[str, int] = {"NIT": 0, "MINOR": 1, "MAJOR": 2, "BLOCKER": 3}
+
+
+def _severity_counts(text: str) -> dict[str, int]:
+    counts = {"BLOCKER": 0, "MAJOR": 0, "MINOR": 0, "NIT": 0}
+    for m in _RE_SEVERITY_TAG.finditer(text):
+        tag = m.group(1)
+        if tag in counts:
+            counts[tag] += 1
+    return counts
+
+
+def _merge_counts(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
+    return {k: int(a.get(k, 0)) + int(b.get(k, 0)) for k in ("BLOCKER", "MAJOR", "MINOR", "NIT")}
+
+
+def _max_severity(counts: dict[str, int]) -> str | None:
+    best: str | None = None
+    best_rank = -1
+    for tag in ("NIT", "MINOR", "MAJOR", "BLOCKER"):
+        if int(counts.get(tag, 0)) <= 0:
+            continue
+        r = _SEV_RANK[tag]
+        if r > best_rank:
+            best_rank = r
+            best = tag
+    return best
+
+
+def _evaluate_review_policy(
+    policy: ReviewReactionPolicy, *, report: StructuredReport
+) -> tuple[str, JsonDict]:
+    """
+    Returns (action, meta):
+    - action: "default" | "return" | "escalate"
+    """
+    out_counts = _severity_counts(report.output or "")
+    next_counts = _severity_counts(report.next_inputs or "")
+    counts = _merge_counts(out_counts, next_counts)
+    total = sum(counts.values())
+    max_sev = _max_severity(counts)
+
+    triggered = False
+    if policy.trigger == "status_failed":
+        triggered = report.status == Status.FAILED
+    elif policy.trigger == "any_tag":
+        triggered = total > 0
+        if triggered and policy.min_severity is not None and max_sev is not None:
+            if _SEV_RANK[max_sev] < _SEV_RANK[policy.min_severity]:
+                triggered = False
+
+    overflow = False
+    if triggered:
+        if policy.max_severity is not None and max_sev is not None:
+            if _SEV_RANK[max_sev] > _SEV_RANK[policy.max_severity]:
+                overflow = True
+        if policy.max_blockers is not None and counts["BLOCKER"] > policy.max_blockers:
+            overflow = True
+        if policy.max_majors is not None and counts["MAJOR"] > policy.max_majors:
+            overflow = True
+        if policy.max_total is not None and total > policy.max_total:
+            overflow = True
+
+    action = "default"
+    if triggered:
+        action = policy.on_overflow if overflow else policy.on_trigger
+
+    meta: JsonDict = {
+        "policy_actor_id": policy.actor_id,
+        "policy_trigger": policy.trigger,
+        "policy_min_severity": policy.min_severity,
+        "policy_max_severity": policy.max_severity,
+        "policy_max_blockers": policy.max_blockers,
+        "policy_max_majors": policy.max_majors,
+        "policy_max_total": policy.max_total,
+        "policy_on_trigger": policy.on_trigger,
+        "policy_on_overflow": policy.on_overflow,
+        "triggered": triggered,
+        "overflow": overflow,
+        "counts": counts,
+        "total": total,
+        "max_severity": max_sev,
+        "report_status": report.status.value,
+    }
+    return action, meta
 
 
 class TimelineWriter:
@@ -891,6 +980,9 @@ class OrchestratorEngine:
 
             max_returns = orch.max_returns
             return_from = set(orch.return_from)
+            review_policies: dict[str, ReviewReactionPolicy] = {
+                p.actor_id: p for p in orch.review_policies
+            }
             returns_used = 0
             invocation_i = 0
             stage_i = 0
@@ -938,6 +1030,205 @@ class OrchestratorEngine:
                     break
 
                 final_report = report
+
+                # Optional policy: react to reviewer findings (tag-based) regardless of status.
+                policy = review_policies.get(actor_id)
+                if policy is not None:
+                    action, meta = _evaluate_review_policy(policy, report=report)
+                    if meta.get("triggered"):
+                        timeline.append(
+                            {
+                                "type": "review_policy_evaluated",
+                                "run_id": run_id,
+                                "step": step_name,
+                                "actor_id": actor_id,
+                                "action": action,
+                                "meta": meta,
+                            }
+                        )
+
+                    if action == "escalate":
+                        overall_status = Status.NEEDS_INPUT
+                        counts = meta.get("counts") if isinstance(meta.get("counts"), dict) else {}
+                        msg = (
+                            "Escalation: review reaction policy requested escalation.\n"
+                            f"actor_id={actor_id}\n"
+                            f"trigger={meta.get('policy_trigger')}\n"
+                            f"counts={counts}\n"
+                            f"max_severity={meta.get('max_severity')}\n"
+                        )
+                        final_report = StructuredReport(
+                            status=Status.NEEDS_INPUT,
+                            output=msg,
+                            next_inputs=report.next_inputs or report.output,
+                            artifacts=(),
+                        )
+                        final_text = (
+                            json.dumps(
+                                {
+                                    "status": final_report.status.value,
+                                    "output": final_report.output,
+                                    "next_inputs": final_report.next_inputs,
+                                    "artifacts": list(final_report.artifacts),
+                                },
+                                indent=2,
+                                sort_keys=True,
+                            )
+                            + "\n"
+                        )
+                        state["status"] = overall_status.value
+                        state["finished_at_utc"] = _now_iso_utc()
+                        _write_json(state_path, state)
+                        timeline.append(
+                            {
+                                "type": "run_stopped",
+                                "run_id": run_id,
+                                "status": overall_status.value,
+                                "reason": "review_policy_escalation",
+                                "step": step_name,
+                                "actor_id": actor_id,
+                                "meta": meta,
+                            }
+                        )
+                        break
+
+                    if action == "return":
+                        can_return = (
+                            return_to_idx is not None
+                            and actor_id in return_from
+                            and return_to_idx != stage_i
+                            and max_returns >= 0
+                        )
+                        if not can_return:
+                            overall_status = Status.NEEDS_INPUT
+                            msg = (
+                                "Escalation: review reaction policy requested a return, "
+                                "but orchestration return routing is not configured.\n"
+                                f"actor_id={actor_id} return_to={orch.return_to or '(none)'}\n"
+                            )
+                            final_report = StructuredReport(
+                                status=Status.NEEDS_INPUT,
+                                output=msg,
+                                next_inputs=report.next_inputs or report.output,
+                                artifacts=(),
+                            )
+                            final_text = (
+                                json.dumps(
+                                    {
+                                        "status": final_report.status.value,
+                                        "output": final_report.output,
+                                        "next_inputs": final_report.next_inputs,
+                                        "artifacts": list(final_report.artifacts),
+                                    },
+                                    indent=2,
+                                    sort_keys=True,
+                                )
+                                + "\n"
+                            )
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "review_policy_return_not_possible",
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                    "meta": meta,
+                                }
+                            )
+                            break
+
+                        returns_used += 1
+                        if returns_used > max_returns:
+                            overall_status = Status.NEEDS_INPUT
+                            msg = (
+                                "Escalation: exceeded max returns in workflow.\n"
+                                f"returns_used={returns_used} max_returns={max_returns}\n"
+                            )
+                            final_report = StructuredReport(
+                                status=Status.NEEDS_INPUT,
+                                output=msg,
+                                next_inputs=report.next_inputs or report.output,
+                                artifacts=(),
+                            )
+                            final_text = (
+                                json.dumps(
+                                    {
+                                        "status": final_report.status.value,
+                                        "output": final_report.output,
+                                        "next_inputs": final_report.next_inputs,
+                                        "artifacts": list(final_report.artifacts),
+                                    },
+                                    indent=2,
+                                    sort_keys=True,
+                                )
+                                + "\n"
+                            )
+                            state["status"] = overall_status.value
+                            state["finished_at_utc"] = _now_iso_utc()
+                            _write_json(state_path, state)
+                            timeline.append(
+                                {
+                                    "type": "run_stopped",
+                                    "run_id": run_id,
+                                    "status": overall_status.value,
+                                    "reason": "max_returns_exceeded",
+                                    "returns_used": returns_used,
+                                    "max_returns": max_returns,
+                                    "step": step_name,
+                                    "actor_id": actor_id,
+                                }
+                            )
+                            break
+
+                        # Return feedback to return_to actor.
+                        assert return_to_idx is not None
+                        return_cfg = stage_cfgs[return_to_idx]
+                        return_packet_dir = run_packets_dir / return_cfg.packet_dir
+                        fb = ["# INPUTS", ""]
+                        counts = meta.get("counts") if isinstance(meta.get("counts"), dict) else {}
+                        total_findings = meta.get("total")
+                        if isinstance(total_findings, int) and total_findings > 0:
+                            fb.append("Findings summary:")
+                            fb.append(
+                                f"- BLOCKER={counts.get('BLOCKER', 0)} "
+                                f"MAJOR={counts.get('MAJOR', 0)} "
+                                f"MINOR={counts.get('MINOR', 0)} "
+                                f"NIT={counts.get('NIT', 0)}"
+                            )
+                            fb.append("")
+                        if last_commit:
+                            fb.append("Commit under review:")
+                            fb.append(f"- {last_commit}")
+                            fb.append("")
+                        fb.append("Feedback:")
+                        fb.append("")
+                        fb.append(report.output.rstrip())
+                        fb.append("")
+                        if report.next_inputs.strip():
+                            fb.append("Requested changes:")
+                            fb.append("")
+                            fb.append(report.next_inputs.rstrip())
+                            fb.append("")
+                        fb.append(f"Return count: {returns_used}/{max_returns}")
+                        write_inputs(return_packet_dir, "\n".join(fb).rstrip() + "\n")
+                        timeline.append(
+                            {
+                                "type": "review_policy_return",
+                                "run_id": run_id,
+                                "from_step": step_name,
+                                "from_actor_id": actor_id,
+                                "to_actor_id": stage_cfgs[return_to_idx].actor_id,
+                                "returns_used": returns_used,
+                                "max_returns": max_returns,
+                                "meta": meta,
+                            }
+                        )
+                        stage_i = return_to_idx
+                        continue
 
                 if report.status == Status.OK:
                     commit = _git_commit_step(

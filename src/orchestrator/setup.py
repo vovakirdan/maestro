@@ -19,6 +19,7 @@ from src.core.runtime import (
     OrchestrationConfig,
     PipelineConfig,
     ProviderConfig,
+    ReviewReactionPolicy,
     TaskConfig,
     TaskKind,
     orchestrator_root,
@@ -250,8 +251,11 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
         if template_id == "reviewer":
             return (
                 "Task-specific guardrails (feature):\n"
-                "- Look for regressions, subtle behavior changes, and backwards-compat risks.\n"
-                "- Check that validation covers both the new behavior and key existing flows.\n"
+                "- Treat regressions as blockers; look for subtle behavior changes.\n"
+                "- Verify backwards-compatibility: existing flows/contracts still work.\n"
+                "- Check risky rollout areas: defaults, feature flags, fallbacks (when relevant).\n"
+                "- Ensure validation covers both the new behavior and key existing behavior.\n"
+                "- Call out missing edge cases and failure-mode handling.\n"
             )
         if template_id == "tester":
             return (
@@ -272,7 +276,9 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "Task-specific guardrails (bug):\n"
                 "- Verify the change addresses the root cause, not just symptoms.\n"
                 "- Watch for overly broad fixes and hidden behavior changes.\n"
-                "- Ensure there is a regression test or a clear repro/verification plan.\n"
+                "- Require clear expected vs actual behavior and why the fix is correct.\n"
+                "- Ensure there is regression coverage (test or precise repro/verification).\n"
+                "- Look for new edge cases introduced by the fix (nulls, retries, races, boundaries).\n"
             )
         if template_id == "tester":
             return (
@@ -293,6 +299,8 @@ def _task_rules_appendix(kind: TaskKind, *, template_id: str) -> str:
                 "Task-specific guardrails (bootstrap):\n"
                 "- Check that requirements and acceptance criteria are explicit and testable.\n"
                 "- Look for missing glue: docs, run instructions, and basic validation.\n"
+                "- Look for unsafe defaults, missing error handling, and unclear boundaries.\n"
+                "- Prefer a minimal, runnable baseline over partial, speculative scaffolding.\n"
             )
         if template_id == "tester":
             return (
@@ -314,7 +322,9 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
         if template_id == "reviewer":
             return (
                 "Task-specific deliverables (feature):\n"
-                "- If changes are required, write a concise checklist in next_inputs.\n"
+                "- Use severity tags in findings ([BLOCKER]/[MAJOR]/[MINOR]/[NIT]).\n"
+                "- If changes are required, write next_inputs as a checklist with one action per bullet.\n"
+                "- Call out regression risks and missing validation explicitly.\n"
             )
         if template_id == "tester":
             return (
@@ -332,6 +342,8 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
             return (
                 "Task-specific deliverables (bug):\n"
                 "- If rejecting, include the minimal repro/verification evidence needed.\n"
+                "- Require a root-cause explanation and regression coverage (test or precise steps).\n"
+                "- Use severity tags and a one-action-per-bullet checklist in next_inputs.\n"
             )
         if template_id == "tester":
             return (
@@ -349,6 +361,7 @@ def _task_target_appendix(kind: TaskKind, *, template_id: str) -> str:
             return (
                 "Task-specific deliverables (bootstrap):\n"
                 "- Call out missing requirements, unclear acceptance criteria, or unsafe defaults.\n"
+                "- If rejecting, next_inputs must be a one-action-per-bullet checklist.\n"
             )
         if template_id == "tester":
             return (
@@ -806,6 +819,58 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                     max_returns=max_returns,
                     return_to=return_to,
                     return_from=return_from,
+                )
+
+    # Optional: configure how the orchestrator reacts to reviewer findings.
+    if orchestration is not None:
+        reviewer_actor_ids = [a.actor_id for a in agents if a.template_id == "reviewer"]
+        if reviewer_actor_ids:
+            reviewer_actor_id = reviewer_actor_ids[0]
+            mode = _prompt_choice(
+                "Review reaction (status_failed/any_tag/only_minor/majors_leq_n/escalate)",
+                choices=["status_failed", "any_tag", "only_minor", "majors_leq_n", "escalate"],
+                default="status_failed",
+            )
+            policy: ReviewReactionPolicy | None = None
+            if mode == "any_tag":
+                policy = ReviewReactionPolicy(actor_id=reviewer_actor_id, trigger="any_tag")
+            elif mode == "only_minor":
+                policy = ReviewReactionPolicy(
+                    actor_id=reviewer_actor_id,
+                    trigger="any_tag",
+                    max_severity="MINOR",
+                    on_trigger="return",
+                    on_overflow="escalate",
+                )
+            elif mode == "majors_leq_n":
+                n = _prompt_int(
+                    "Max MAJOR findings to return (exceed => escalate)",
+                    min_value=0,
+                    max_value=20,
+                    default=3,
+                )
+                policy = ReviewReactionPolicy(
+                    actor_id=reviewer_actor_id,
+                    trigger="any_tag",
+                    max_majors=n,
+                    on_trigger="return",
+                    on_overflow="escalate",
+                )
+            elif mode == "escalate":
+                policy = ReviewReactionPolicy(
+                    actor_id=reviewer_actor_id,
+                    trigger="status_failed",
+                    on_trigger="escalate",
+                    on_overflow="escalate",
+                )
+
+            if policy is not None:
+                orchestration = OrchestrationConfig(
+                    preset=orchestration.preset,
+                    max_returns=orchestration.max_returns,
+                    return_to=orchestration.return_to,
+                    return_from=orchestration.return_from,
+                    review_policies=(policy,),
                 )
 
     interaction_notes = _prompt_multiline_optional("Workflow/interaction notes")

@@ -48,6 +48,7 @@ Workspace layout created by `setup`:
 Setup flow:
 - Task type (feature/bug/bootstrap/other).
 - Workflow preset (crt/cr/c/r/t/d/custom).
+- Optional: configure how the orchestrator reacts to reviewer findings (status-only vs tag/threshold based return vs escalation).
 - Provider selection:
   - The CLI only offers providers that are installed (found on PATH).
   - You can use one provider for everything (wizard + all agents), or split it:
