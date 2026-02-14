@@ -93,7 +93,8 @@ Run flow:
   - `auto`: generate a plan via the first non-deterministic provider in the pipeline and inject it into INPUTS.md.
   - `user`: use a user plan (paste or file path).
   - `none`: no plan injection.
-- Git safety (branch/check/off), if the workspace is a git repo root:
+- Git safety uses `pipeline.json` defaults configured during `setup`.
+  - To override interactively, run with `--ask-git`.
   - `branch`: require clean tree (ignores changes under `orchestrator/`), create a run branch, optional auto-commit.
   - `check`: require clean tree (ignores changes under `orchestrator/`), do not switch branches.
   - `off`: no git checks.

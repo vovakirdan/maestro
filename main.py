@@ -40,6 +40,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Override provider idle timeout seconds (0 disables idle timeout).",
     )
+    run_p.add_argument(
+        "--ask-git",
+        action="store_true",
+        help="Prompt for git policy even when pipeline.git_defaults is present.",
+    )
     return p.parse_args(argv)
 
 
@@ -320,33 +325,57 @@ def main(argv: list[str] | None = None) -> int:
                     plan_req = PlanRequest(mode="none", text="")
 
             git_policy: GitPolicy | None = None
-            if sys.stdin.isatty():
-                ws = workspace_dir.resolve()
-                is_git_root = (ws / ".git").exists()
-                if is_git_root:
-                    git_mode = _prompt_choice(
-                        "Git safety (branch/check/off)",
-                        choices=["branch", "check", "off"],
-                        default="branch",
-                    )
-                    if git_mode != "off":
-                        prefix = ""
-                        auto_commit = False
-                        if git_mode == "branch":
-                            prefix = input("Git branch prefix [orch/]: ").strip() or "orch/"
-                            auto_commit = (
-                                _prompt_choice(
-                                    "Auto-commit after coder steps? (y/n)",
-                                    choices=["y", "n"],
-                                    default="y",
-                                )
-                                == "y"
+            gd = engine.pipeline.git_defaults
+            if gd is not None and gd.mode != "off":
+                git_policy = GitPolicy(
+                    mode=gd.mode,
+                    branch_prefix=gd.branch_prefix,
+                    auto_commit=gd.auto_commit,
+                    branch_template=gd.branch_template,
+                    branch_slug=gd.branch_slug,
+                    commit_message_template=gd.commit_message_template,
+                )
+
+            # Interactive override (optional). By default, run uses pipeline.git_defaults.
+            if sys.stdin.isatty() and (args.ask_git or gd is None):
+                default_mode = "off"
+                if gd is not None:
+                    default_mode = gd.mode
+                elif (workspace_dir.resolve() / ".git").exists():
+                    default_mode = "branch"
+                git_mode = _prompt_choice(
+                    "Git safety (branch/check/off)",
+                    choices=["branch", "check", "off"],
+                    default=default_mode,
+                )
+                if git_mode == "off":
+                    git_policy = None
+                else:
+                    # Preserve advanced defaults (templates) unless the user edits pipeline.json.
+                    branch_template = gd.branch_template if gd is not None else None
+                    branch_slug = gd.branch_slug if gd is not None else None
+                    commit_message_template = gd.commit_message_template if gd is not None else None
+
+                    prefix = gd.branch_prefix if gd is not None else "orch/"
+                    auto_commit = gd.auto_commit if gd is not None else False
+                    if git_mode == "branch":
+                        prefix = input(f"Git branch prefix [{prefix}]: ").strip() or prefix
+                        auto_commit = (
+                            _prompt_choice(
+                                "Auto-commit after implementer steps? (y/n)",
+                                choices=["y", "n"],
+                                default="y" if auto_commit else "n",
                             )
-                        git_policy = GitPolicy(
-                            mode=git_mode,
-                            branch_prefix=prefix or "orch/",
-                            auto_commit=auto_commit,
+                            == "y"
                         )
+                    git_policy = GitPolicy(
+                        mode=git_mode,
+                        branch_prefix=prefix,
+                        auto_commit=auto_commit if git_mode == "branch" else False,
+                        branch_template=branch_template,
+                        branch_slug=branch_slug,
+                        commit_message_template=commit_message_template,
+                    )
 
             outcome = engine.run(
                 progress=ui.log_line,
