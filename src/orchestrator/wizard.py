@@ -98,7 +98,11 @@ def run_setup_wizard_analyze(
     )
     for a in agents:
         spec = a.specialization.strip() or "(none)"
-        prompt += f"- {a.actor_id}: template={a.template_id} specialization={spec}\n"
+        if a.template_id in {"custom", "other"}:
+            role = a.custom_role.strip() or "(missing)"
+            prompt += f"- {a.actor_id}: template={a.template_id} role_description={role}\n"
+        else:
+            prompt += f"- {a.actor_id}: template={a.template_id} specialization={spec}\n"
     prompt += "\n"
 
     if orchestration is not None:
@@ -268,6 +272,9 @@ def run_setup_wizard_write_packet(
     task_kind = task.kind if task is not None else "other"
     task_details = task.details_md.strip() if task is not None else ""
     task_details_block = f"Task details:\n{task_details}\n\n" if task_details else ""
+    role_desc_block = ""
+    if agent.template_id in {"custom", "other"} and agent.custom_role.strip():
+        role_desc_block = f"User-provided role description:\n{agent.custom_role.strip()}\n\n"
 
     prompt = "".join(
         [
@@ -295,6 +302,7 @@ def run_setup_wizard_write_packet(
             f"Agent id: {agent.actor_id}\n",
             f"Template: {agent.template_id}\n",
             f"Specialization: {specialization}\n\n",
+            role_desc_block,
             "Setup brief (high-signal decomposition; do not mention orchestration):\n",
             f"{brief_md.strip()}\n\n",
             "Base ROLE.md:\n",
@@ -333,4 +341,3 @@ def run_setup_wizard_write_packet(
         "INPUTS": obj["inputs_md"].rstrip() + "\n",
     }
     return WizardPacketResult(docs=docs), res.metadata
-

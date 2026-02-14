@@ -71,6 +71,8 @@ Workflow presets:
 - `d`: devops only.
 - `custom`: 1-6 stages, choose templates (`coder/reviewer/tester/devops/custom`) and optionally configure
   a linear return-on-failure loop.
+- `other` (custom stage template): requires a role description (multiline) so the setup wizard can produce good packets.
+  Use this when the built-ins do not fit but you still want structured setup.
 
 Run flow:
 - Plan mode (auto/user/none):

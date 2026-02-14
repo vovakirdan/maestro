@@ -99,6 +99,14 @@ def _prompt_multiline_optional(label: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _prompt_multiline_required(label: str) -> str:
+    while True:
+        text = _prompt_multiline_optional(label.replace("(optional)", "").strip())
+        if text.strip():
+            return text
+        print("Please provide a non-empty description (end with a single '.' line).")
+
+
 class _SetupRefineUI:
     def __init__(self, *, label: str) -> None:
         self._label = label
@@ -374,11 +382,37 @@ def _base_packet_docs(
     agent: AgentSpec,
     is_first: bool,
 ) -> dict[str, str]:
-    if agent.template_id == "custom":
-        role_md = "# ROLE\n\n" + agent.custom_role.strip() + "\n"
-        rules_md = "# RULES\n\nFollow ROLE, TARGET, and REPORT_FORMAT.\n"
-        context_md = "# CONTEXT\n\nYou have access to a workspace/repository to modify.\n"
-        target_md = "# TARGET\n\n" f"Goal:\n{goal}\n\nDescribe what you will do in this step.\n"
+    if agent.template_id in {"custom", "other"}:
+        role_text = agent.custom_role.strip()
+        if not role_text:
+            role_text = "Describe your role, responsibilities, non-goals, and deliverables."
+        role_md = "# ROLE\n\n" + role_text + "\n"
+        rules_md = (
+            "# RULES\n\n"
+            "General:\n"
+            "- Follow ROLE, TARGET, and REPORT_FORMAT.\n"
+            "- Treat the workspace as the source of truth; read files instead of guessing.\n"
+            "- Do not invent file contents, APIs, or executed validation results.\n"
+            "- If you propose commands you did not run, label them as suggestions.\n\n"
+            "Safety:\n"
+            "- Prefer minimal, reversible changes.\n"
+            "- Do not run destructive commands (no rm -rf) unless explicitly required.\n"
+            "- Do not run dependency installation commands unless explicitly allowed.\n\n"
+            "When blocked:\n"
+            '- Use status="NEEDS_INPUT" and ask precise questions.\n'
+        )
+        context_md = (
+            "# CONTEXT\n\n"
+            "You have access to a workspace/repository to modify.\n"
+            "Additional constraints or feedback (if any) are provided in INPUTS.md.\n"
+        )
+        target_md = (
+            "# TARGET\n\n"
+            f"Goal:\n{goal}\n\n"
+            "Deliverables:\n"
+            "- output: what you did and why (include concrete file paths).\n"
+            "- next_inputs: any follow-up or validation guidance (or empty).\n"
+        )
     else:
         tmpl = get_template(agent.template_id)
         role_md = tmpl.base_role_md
@@ -703,7 +737,7 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
             max_value=6,
             default=2,
         )
-        template_ids = list_template_ids() + ["custom"]
+        template_ids = list_template_ids() + ["other", "custom"]
         used_actor_ids: set[str] = set()
 
         for i in range(1, stage_count + 1):
@@ -728,9 +762,17 @@ def run_interactive_setup(*, workspace_dir: Path) -> SetupResult:
                 used_actor_ids.add(actor_id)
                 break
 
-            if template_id == "custom":
-                role = _prompt_line(f"Role for {actor_id}")
-                agents.append(AgentSpec(actor_id=actor_id, template_id="custom", custom_role=role))
+            if template_id in {"custom", "other"}:
+                if template_id == "custom":
+                    role = _prompt_line(f"Role for {actor_id}")
+                else:
+                    print(
+                        "Template 'other' requires a clear role description so the setup wizard can prepare good packets."
+                    )
+                    role = _prompt_multiline_required(
+                        f"Describe role for {actor_id}. Include: who they are, responsibilities, non-goals, deliverables"
+                    )
+                agents.append(AgentSpec(actor_id=actor_id, template_id=template_id, custom_role=role))
             else:
                 specialization = _prompt_optional_line(f"Specialization for {actor_id} (optional)")
                 agents.append(
